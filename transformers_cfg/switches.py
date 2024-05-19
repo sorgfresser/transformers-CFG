@@ -23,13 +23,12 @@ def switch_experts_top_k(
     probabilities = F.softmax(logits, dim=-1)
     # Check if one of k best tokens adheres to the grammar
     k_best = torch.topk(probabilities, TOP_K, dim=-1)
-    for i in range(TOP_K):
-        if k_best.indices[i] in allowed_tokens:
-            print(
-                "Not switching experts as one of the top k tokens adheres to the grammar",
-                k_best.indices[i],
-            )
-            return False
+    if any([i in allowed_tokens for i in k_best.indices]):
+        print(
+            "Not switching experts as one of the top k tokens adheres to the grammar",
+            k_best.indices,
+        )
+        return False
     print("Switching experts as none of the top k tokens adheres to the grammar")
     return True
 

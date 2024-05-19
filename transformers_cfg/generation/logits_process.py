@@ -16,14 +16,17 @@ logger = logging.getLogger(__name__)
 
 
 class GrammarConstrainedLogitsProcessor(LogitsProcessor):
-    def __init__(self, grammar_constraint, parse_start_index=None, switch_experts=None):
+    def __init__(
+        self,
+        grammar_constraint,
+        parse_start_index=None,
+    ):
         self.last_size = None
         self.grammar_constraint = grammar_constraint
         self.batch_accept_states = None
         self.parse_start_index = None
-        self.switch_experts = switch_experts
 
-    def mask_logits(self, logits, device, router_logits, experts=None):
+    def mask_logits(self, logits, device):
         masked_logits = logits.clone()
         # resolve each stack to a tensor of True/False for each token
         # indicating acceptance
@@ -59,47 +62,10 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
 
         # Logits to -inf where False
         masked_logits[~acceptance] = -math.inf
-        # Get allowed tokens
-        batch_size, vocab_size = acceptance.shape
-        acceptance_np = acceptance.cpu().numpy()
-        accepted_x, accepted_y = acceptance_np.nonzero()
-        accepted_token_indices = {i: [] for i in range(batch_size)}
-        for x, y in zip(accepted_x, accepted_y):
-            accepted_token_indices[x].append(y)
-        if self.switch_experts:
-            experts_tried = [
-                ([None] * len(router_logits[0])).copy()
-                for _ in range(len(router_logits))
-            ]
-            # For each element in the batch, switch experts if the token is not in the accepted tokens
-            for i in range(batch_size):
-                # last layer, last token of batch
-                experts_tried[-1][
-                    int((i + 1) * (router_logits[0].shape[0] // batch_size) - 1)
-                ] = [
-                    tuple(
-                        experts[-1][
-                            (i + 1) * (router_logits[0].shape[0] // batch_size) - 1,
-                            :,
-                        ].tolist()
-                    )
-                ]
-
-                while self.switch_experts(
-                    logits[i],
-                    accepted_token_indices[i],
-                    router_logits[-1][
-                        (i + 1) * (router_logits[0].shape[0] // batch_size) - 1
-                    ],  # last layer, last token of batch
-                    experts_tried[-1][
-                        (i + 1) * (router_logits[0].shape[0] // batch_size) - 1
-                    ],  # last layer, last token of batch
-                ):
-                    pass
         return masked_logits
 
     # TODO: batching
-    def process_logits(self, input_ids, scores, router_logits=None, experts=None):
+    def process_logits(self, input_ids, scores):
         """
         :param input_ids:
         :param scores:
@@ -134,7 +100,7 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
         )
         logger.debug(f"input_ids: {input_ids}")
 
-        masked_scores = self.mask_logits(scores, scores.device, router_logits, experts)
+        masked_scores = self.mask_logits(scores, scores.device)
         return masked_scores
 
     @add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
@@ -143,7 +109,5 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
         self,
         input_ids: torch.LongTensor,
         scores: torch.FloatTensor,
-        router_logits: torch.FloatTensor = None,
-        experts: tuple[torch.IntTensor] = None,
     ) -> torch.FloatTensor:
-        return self.process_logits(input_ids, scores, router_logits, experts)
+        return self.process_logits(input_ids, scores)

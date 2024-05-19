@@ -1,6 +1,41 @@
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
-
-from transformers import MixtralForCausalLM
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union, Callable, Dict, Any
+import inspect
+from transformers import (
+    MixtralForCausalLM,
+    LogitsProcessorList,
+    StoppingCriteriaList,
+    GenerationConfig,
+)
+from transformers_cfg.switches import TooManyExpertsError
+from transformers.generation.utils import (
+    GenerateNonBeamOutput,
+    GenerateEncoderDecoderOutput,
+    GenerateDecoderOnlyOutput,
+)
+from transformers.generation.logits_process import (
+    EncoderNoRepeatNGramLogitsProcessor,
+    EncoderRepetitionPenaltyLogitsProcessor,
+    ExponentialDecayLengthPenalty,
+    ForcedBOSTokenLogitsProcessor,
+    ForcedEOSTokenLogitsProcessor,
+    ForceTokensLogitsProcessor,
+    HammingDiversityLogitsProcessor,
+    InfNanRemoveLogitsProcessor,
+    LogitNormalization,
+    LogitsProcessorList,
+    MinLengthLogitsProcessor,
+    MinNewTokensLengthLogitsProcessor,
+    NoBadWordsLogitsProcessor,
+    NoRepeatNGramLogitsProcessor,
+    PrefixConstrainedLogitsProcessor,
+    RepetitionPenaltyLogitsProcessor,
+    SequenceBiasLogitsProcessor,
+    SuppressTokensAtBeginLogitsProcessor,
+    SuppressTokensLogitsProcessor,
+    UnbatchedClassifierFreeGuidanceLogitsProcessor,
+    WatermarkLogitsProcessor,
+)
+import copy
 from transformers.models.mixtral.modeling_mixtral import (
     MIXTRAL_INPUTS_DOCSTRING,
     MoeCausalLMOutputWithPast,
@@ -18,7 +53,7 @@ from transformers.models.mixtral.modeling_mixtral import (
     MixtralRMSNorm,
     MixtralSparseMoeBlock,
 )
-from transformers.utils import logging
+from transformers.utils import logging, is_torchdynamo_compiling
 from dataclasses import dataclass
 import torch
 from torch import nn
@@ -26,7 +61,8 @@ import torch.nn.functional as F
 import warnings
 
 if TYPE_CHECKING:
-    from transformers import MixtralConfig, PreTrainedTokenizer
+    from transformers import MixtralConfig
+    from transformers.generation.utils import BaseStreamer
 
 KVCacheType = Tuple[Tuple["torch.DoubleTensor", "torch.DoubleTensor"], ...]
 
@@ -41,6 +77,53 @@ class MoeModelOutputWithPastExperts(MoeModelOutputWithPast):
 @dataclass
 class MoeCausalLMOutputWithPastExperts(MoeCausalLMOutputWithPast):
     experts: Optional[Tuple[torch.FloatTensor]] = None
+
+
+class GenerationConfigRoutable(GenerationConfig):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.switch_experts = kwargs.pop("switch_experts", None)
+
+
+class LogitsProcessorListCallable(LogitsProcessorList):
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
+    ) -> torch.FloatTensor:
+        r"""
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary. [What are input IDs?](../glossary#input-ids)
+            scores (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`):
+                Prediction scores of a language modeling head. These can be logits for each vocabulary when not using
+                beam search or log softmax for each vocabulary token when using beam search
+            kwargs (`Dict[str, Any]`, *optional*):
+                Additional kwargs that are specific to a logits processor.
+
+        Return:
+            `torch.FloatTensor` of shape `(batch_size, config.vocab_size)`:
+                The processed prediction scores.
+
+        """
+        for processor in self:
+            function_args = inspect.signature(processor.__call__).parameters
+            # Processor is __init__
+            if (
+                len(function_args) == 2
+                and "args" in function_args
+                and "kwargs" in function_args
+            ):
+                processor = processor()
+            if len(function_args) > 2:
+                if not all(arg in kwargs for arg in list(function_args.keys())[2:]):
+                    raise ValueError(
+                        f"Make sure that all the required parameters: {list(function_args.keys())} for "
+                        f"{processor.__class__} are passed to the logits processor."
+                    )
+                scores = processor(input_ids, scores, **kwargs)
+            else:
+                scores = processor(input_ids, scores)
+
+        return scores
 
 
 class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
@@ -58,6 +141,9 @@ class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
     ) -> torch.Tensor:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
+        assert (
+            batch_size == 1 or experts_used is None
+        )  # experts_used is only supported for batch_size=1, TODO: fix
         if self.training and self.jitter_noise > 0:
             hidden_states *= torch.empty_like(hidden_states).uniform_(
                 1.0 - self.jitter_noise, 1.0 + self.jitter_noise
@@ -78,15 +164,16 @@ class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
         )  # (batch * sequence_length, n_combinations)
         # Remove expert combs already used from combinations
         if experts_used is not None:
-            for idx, experts_token in enumerate(experts_used):
-                if experts_token is None:
-                    continue
-                for tok in experts_token:
-                    # Set mask accordingly
-                    expert_comb = torch.tensor(tok, device=routing_combs.device)
-                    combinations_mask[idx] = combinations_mask[idx] & ~(
-                        (combinations[idx] == expert_comb).all(dim=-1)
-                    )
+            for batch in range(batch_size):
+                for idx, experts_token in enumerate(experts_used[batch]):
+                    if experts_token is None:
+                        continue
+                    for tok in experts_token:
+                        # Set mask accordingly
+                        expert_comb = torch.tensor(tok, device=routing_combs.device)
+                        combinations_mask[idx] = combinations_mask[idx] & ~(
+                            (combinations[idx] == expert_comb).all(dim=-1)
+                        )
 
         # Apply mask
         routing_combs = routing_combs.masked_fill(~combinations_mask[:, :, None], 0)
@@ -255,6 +342,28 @@ class MixtralModelRoutable(MixtralModel):
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
+
+    def _sample(
+        self,
+        input_ids: torch.LongTensor,
+        logits_processor: LogitsProcessorList,
+        stopping_criteria: StoppingCriteriaList,
+        generation_config: GenerationConfig,
+        synced_gpus: bool,
+        streamer: Optional["BaseStreamer"],
+        logits_warper: Optional[LogitsProcessorList] = None,
+        **model_kwargs,
+    ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
+        return super()._sample(
+            input_ids,
+            logits_processor,
+            stopping_criteria,
+            generation_config,
+            synced_gpus,
+            streamer,
+            logits_warper,
+            **model_kwargs,
+        )
 
     @add_start_docstrings_to_model_forward(MIXTRAL_INPUTS_DOCSTRING)
     def forward(
@@ -476,6 +585,579 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
         self.num_experts_per_tok = config.num_experts_per_tok
         # Initialize weights and apply final processing
         self.post_init()
+
+    def _get_logits_processor(
+        self,
+        generation_config: GenerationConfig,
+        input_ids_seq_length: int,
+        encoder_input_ids: torch.LongTensor,
+        prefix_allowed_tokens_fn: Callable[[int, torch.Tensor], List[int]],
+        logits_processor: Optional[LogitsProcessorList],
+        device: str = None,
+        model_kwargs: Optional[Dict[str, Any]] = None,
+        negative_prompt_ids: Optional[torch.Tensor] = None,
+        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+    ) -> LogitsProcessorList:
+        """
+        This class returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsProcessor`]
+        instances used to modify the scores of the language model head.
+        """
+        # instantiate processors list
+        processors = LogitsProcessorListCallable()
+
+        if (
+            generation_config.guidance_scale is not None
+            and generation_config.guidance_scale != 1
+        ):
+            processors.append(
+                UnbatchedClassifierFreeGuidanceLogitsProcessor(
+                    generation_config.guidance_scale,
+                    self,
+                    unconditional_ids=negative_prompt_ids,
+                    unconditional_attention_mask=negative_prompt_attention_mask,
+                    use_cache=model_kwargs["use_cache"],
+                )
+            )
+        if generation_config.sequence_bias is not None:
+            processors.append(
+                SequenceBiasLogitsProcessor(
+                    sequence_bias=generation_config.sequence_bias
+                )
+            )
+
+        if (
+            generation_config.diversity_penalty is not None
+            and generation_config.diversity_penalty > 0.0
+        ):
+            processors.append(
+                HammingDiversityLogitsProcessor(
+                    diversity_penalty=generation_config.diversity_penalty,
+                    num_beams=generation_config.num_beams,
+                    num_beam_groups=generation_config.num_beam_groups,
+                )
+            )
+        if (
+            generation_config.encoder_repetition_penalty is not None
+            and generation_config.encoder_repetition_penalty != 1.0
+        ):
+            processors.append(
+                EncoderRepetitionPenaltyLogitsProcessor(
+                    penalty=generation_config.encoder_repetition_penalty,
+                    encoder_input_ids=encoder_input_ids,
+                )
+            )
+        if (
+            generation_config.repetition_penalty is not None
+            and generation_config.repetition_penalty != 1.0
+        ):
+            processors.append(
+                RepetitionPenaltyLogitsProcessor(
+                    penalty=generation_config.repetition_penalty
+                )
+            )
+        if (
+            generation_config.no_repeat_ngram_size is not None
+            and generation_config.no_repeat_ngram_size > 0
+        ):
+            processors.append(
+                NoRepeatNGramLogitsProcessor(generation_config.no_repeat_ngram_size)
+            )
+        if (
+            generation_config.encoder_no_repeat_ngram_size is not None
+            and generation_config.encoder_no_repeat_ngram_size > 0
+        ):
+            processors.append(
+                EncoderNoRepeatNGramLogitsProcessor(
+                    generation_config.encoder_no_repeat_ngram_size, encoder_input_ids
+                )
+            )
+        if generation_config.bad_words_ids is not None:
+            processors.append(
+                NoBadWordsLogitsProcessor(
+                    generation_config.bad_words_ids, generation_config.eos_token_id
+                )
+            )
+        if (
+            generation_config.min_length is not None
+            and generation_config.eos_token_id is not None
+            and generation_config.min_length > 0
+        ):
+            processors.append(
+                MinLengthLogitsProcessor(
+                    generation_config.min_length, generation_config.eos_token_id
+                )
+            )
+        if (
+            generation_config.min_new_tokens is not None
+            and generation_config.eos_token_id is not None
+            and generation_config.min_new_tokens > 0
+        ):
+            processors.append(
+                MinNewTokensLengthLogitsProcessor(
+                    input_ids_seq_length,
+                    generation_config.min_new_tokens,
+                    generation_config.eos_token_id,
+                )
+            )
+        if prefix_allowed_tokens_fn is not None:
+            processors.append(
+                PrefixConstrainedLogitsProcessor(
+                    prefix_allowed_tokens_fn,
+                    generation_config.num_beams // generation_config.num_beam_groups,
+                )
+            )
+        if generation_config.forced_bos_token_id is not None:
+            processors.append(
+                ForcedBOSTokenLogitsProcessor(generation_config.forced_bos_token_id)
+            )
+        if generation_config.forced_eos_token_id is not None:
+            processors.append(
+                ForcedEOSTokenLogitsProcessor(
+                    generation_config.max_length, generation_config.forced_eos_token_id
+                )
+            )
+        if generation_config.remove_invalid_values is True:
+            processors.append(InfNanRemoveLogitsProcessor())
+        if generation_config.exponential_decay_length_penalty is not None:
+            processors.append(
+                ExponentialDecayLengthPenalty(
+                    generation_config.exponential_decay_length_penalty,
+                    generation_config.eos_token_id,
+                    input_ids_seq_length,
+                )
+            )
+        if generation_config.suppress_tokens is not None:
+            processors.append(
+                SuppressTokensLogitsProcessor(generation_config.suppress_tokens)
+            )
+        if generation_config.begin_suppress_tokens is not None:
+            begin_index = input_ids_seq_length
+            begin_index = (
+                begin_index
+                if (
+                    input_ids_seq_length > 1
+                    or generation_config.forced_bos_token_id is None
+                )
+                else begin_index + 1
+            )
+            if generation_config.forced_decoder_ids is not None:
+                # generation starts after the last token that is forced
+                begin_index += generation_config.forced_decoder_ids[-1][0]
+            processors.append(
+                SuppressTokensAtBeginLogitsProcessor(
+                    generation_config.begin_suppress_tokens, begin_index
+                )
+            )
+        if generation_config.forced_decoder_ids is not None:
+            # TODO(Sanchit): deprecate in v4.40 by removing this logic
+            warnings.warn(
+                "You have explicitly specified `forced_decoder_ids`. This functionality has been deprecated and will throw an error in v4.40. Please remove the `forced_decoder_ids` argument in favour of `input_ids` or `decoder_input_ids` respectively.",
+                FutureWarning,
+            )
+            processors.append(
+                ForceTokensLogitsProcessor(
+                    generation_config.forced_decoder_ids, _has_warned=True
+                )
+            )
+        if generation_config.watermarking_config is not None:
+            processors.append(
+                WatermarkLogitsProcessor(
+                    vocab_size=self.config.vocab_size,
+                    device=device,
+                    greenlist_ratio=generation_config.watermarking_config.greenlist_ratio,
+                    bias=generation_config.watermarking_config.bias,
+                    hashing_key=generation_config.watermarking_config.hashing_key,
+                    seeding_scheme=generation_config.watermarking_config.seeding_scheme,
+                    context_width=generation_config.watermarking_config.context_width,
+                )
+            )
+        processors = self._merge_criteria_processor_list(processors, logits_processor)
+        # `LogitNormalization` should always be the last logit processor, when present
+        if generation_config.renormalize_logits is True:
+            processors.append(LogitNormalization())
+        return processors
+
+    def _sample(
+        self,
+        input_ids: torch.LongTensor,
+        logits_processor: LogitsProcessorList,
+        stopping_criteria: StoppingCriteriaList,
+        generation_config: GenerationConfigRoutable,
+        synced_gpus: bool,
+        streamer: Optional["BaseStreamer"],
+        logits_warper: Optional[LogitsProcessorList] = None,
+        **model_kwargs,
+    ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
+        r"""
+        Generates sequences of token ids for models with a language modeling head using **multinomial sampling** and
+        can be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
+
+        Parameters:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                The sequence used as a prompt for the generation.
+            logits_processor (`LogitsProcessorList`):
+                An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
+                used to modify the prediction scores of the language modeling head applied at each generation step.
+            stopping_criteria (`StoppingCriteriaList`):
+                An instance of [`StoppingCriteriaList`]. List of instances of class derived from [`StoppingCriteria`]
+                used to tell if the generation loop should stop.
+            generation_config ([`~generation.GenerationConfig`]):
+                The generation configuration to be used as parametrization of the decoding method.
+            synced_gpus (`bool`):
+                Whether to continue running the while loop until max_length (needed for ZeRO stage 3)
+            streamer (`BaseStreamer`, *optional*):
+                Streamer object that will be used to stream the generated sequences. Generated tokens are passed
+                through `streamer.put(token_ids)` and the streamer is responsible for any further processing.
+            logits_warper (`LogitsProcessorList`, *optional*):
+                An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsWarper`] used
+                to warp the prediction score distribution of the language modeling head applied before multinomial
+                sampling at each generation step. Only required with sampling strategies (i.e. `do_sample` is set in
+                `generation_config`)
+            model_kwargs:
+                Additional model specific kwargs will be forwarded to the `forward` function of the model. If model is
+                an encoder-decoder model the kwargs should include `encoder_outputs`.
+
+        Return:
+            [`~generation.GenerateDecoderOnlyOutput`], [`~generation.GenerateEncoderDecoderOutput`] or `torch.LongTensor`:
+            A `torch.LongTensor` containing the generated tokens (default behaviour) or a
+            [`~generation.GenerateDecoderOnlyOutput`] if `model.config.is_encoder_decoder=False` and
+            `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
+            `model.config.is_encoder_decoder=True`.
+        """
+        # init values
+        pad_token_id = generation_config.pad_token_id
+        output_attentions = generation_config.output_attentions
+        output_hidden_states = generation_config.output_hidden_states
+        output_scores = generation_config.output_scores
+        output_logits = generation_config.output_logits
+        return_dict_in_generate = generation_config.return_dict_in_generate
+        has_eos_stopping_criteria = any(
+            hasattr(criteria, "eos_token_id") for criteria in stopping_criteria
+        )
+        do_sample = generation_config.do_sample
+        if do_sample is True and not isinstance(logits_warper, LogitsProcessorList):
+            raise ValueError(
+                "`do_sample` is set to `True`, `logits_warper` must be a `LogitsProcessorList` instance (it is "
+                f"{logits_warper})."
+            )
+
+        # init attention / hidden states / scores tuples
+        scores = () if (return_dict_in_generate and output_scores) else None
+        raw_logits = () if (return_dict_in_generate and output_logits) else None
+        decoder_attentions = (
+            () if (return_dict_in_generate and output_attentions) else None
+        )
+        cross_attentions = (
+            () if (return_dict_in_generate and output_attentions) else None
+        )
+        decoder_hidden_states = (
+            () if (return_dict_in_generate and output_hidden_states) else None
+        )
+
+        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+        if return_dict_in_generate and self.config.is_encoder_decoder:
+            encoder_attentions = (
+                model_kwargs["encoder_outputs"].get("attentions")
+                if output_attentions
+                else None
+            )
+            encoder_hidden_states = (
+                model_kwargs["encoder_outputs"].get("hidden_states")
+                if output_hidden_states
+                else None
+            )
+
+        # keep track of which sequences are already finished
+        batch_size = input_ids.shape[0]
+        this_peer_finished = False
+        unfinished_sequences = torch.ones(
+            batch_size, dtype=torch.long, device=input_ids.device
+        )
+        model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+
+        while self._has_unfinished_sequences(
+            this_peer_finished, synced_gpus, device=input_ids.device
+        ):
+            # prepare model inputs
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            if generation_config.switch_experts is not None:
+                if not model_inputs["output_router_logits"]:
+                    logger.warning(
+                        "switch_experts is set but output_router_logits is False. Setting output_router_logits to True."
+                    )
+                model_inputs["output_router_logits"] = True
+            # forward pass to get next token
+            outputs = self(
+                **model_inputs,
+                return_dict=True,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+
+            if synced_gpus and this_peer_finished:
+                continue  # don't waste resources running the code we don't need
+
+            next_token_logits = outputs.logits[:, -1, :]
+
+            # pre-process distribution
+            next_token_scores = logits_processor(
+                input_ids,
+                next_token_logits,
+            )
+
+            if generation_config.switch_experts is not None:
+                # for i in range(batch_size):
+                #     # last layer, last token of batch
+                #     experts_tried[-1][
+                #         int(
+                #             (i + 1) * (outputs.router_logits[0].shape[0] // batch_size)
+                #             - 1
+                #         )
+                #     ] = [
+                #         tuple(
+                #             outputs.experts[-1][
+                #                 (i + 1)
+                #                 * (outputs.router_logits[0].shape[0] // batch_size)
+                #                 - 1,
+                #                 :,
+                #             ].tolist()
+                #         )
+                #     ]
+                # TODO: allow batching
+                for i in range(batch_size):
+                    batch_inputs = copy.deepcopy(model_inputs)
+                    # Only use the i-th batch
+                    # We keep the first dimension to be able to implement batching easier
+                    batch_inputs["input_ids"] = batch_inputs["input_ids"][i, ...][
+                        None, ...
+                    ]
+                    batch_inputs["attention_mask"] = batch_inputs["attention_mask"][
+                        i, ...
+                    ][None, ...]
+                    batch_inputs["position_ids"] = batch_inputs["position_ids"][i, ...][
+                        None, ...
+                    ]
+                    batch_inputs["past_key_values"] = (
+                        [
+                            (key_cache[i, ...][None, ...], val_cache[i, ...][None, ...])
+                            for key_cache, val_cache in batch_inputs["past_key_values"]
+                        ]
+                        if batch_inputs["past_key_values"] is not None
+                        else None
+                    )
+                    batch_outputs = self(
+                        **batch_inputs,
+                        return_dict=True,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states,
+                    )
+
+                    next_token_logits_batch = batch_outputs.logits[:, -1, :]
+
+                    # pre-process distribution
+                    next_token_scores_batch = logits_processor(
+                        batch_inputs["input_ids"],
+                        next_token_logits_batch,
+                    )
+
+                    # Expand router logits to batch size, seq len, num experts
+                    # If the sequence length is different, key value caching has been used, thus router logits is only 1
+                    if (
+                        input_ids.shape[1] * 1
+                        != batch_outputs.router_logits[0].shape[0]
+                    ):
+                        router_logits = [
+                            batch_outputs.router_logits[j].view(1, 1, -1)
+                            for j in range(len(batch_outputs.router_logits))
+                        ]
+                        # Simply expand this as we're using the last token later on
+                        batch_outputs.router_logits = [
+                            router_logits[j].expand(1, input_ids.shape[1], -1)
+                            for j in range(len(router_logits))
+                        ]
+                    router_logits = [
+                        batch_outputs.router_logits[i].view(1, input_ids.shape[1], -1)
+                        for i in range(len(batch_outputs.router_logits))
+                    ]
+
+                    switching_mask = [
+                        torch.zeros(router_logits[i].shape[:2], dtype=torch.bool)
+                        for i in range(len(router_logits))
+                    ]
+                    # Only last token switching is supported
+                    # for i in range(len(outputs.router_logits)):
+                    #     switching_mask[i][:, -1] = True
+                    # Alternative: only last token and last layer
+                    switching_mask[-1][:, -1] = True
+                    experts_tried = [
+                        batch_outputs.experts[i].view(1, input_ids.shape[1], 1, -1)
+                        for i in range(len(batch_outputs.experts))
+                    ]
+                    allowed_tokens = (
+                        next_token_scores_batch != -float("inf")
+                    ).nonzero()
+                    try:
+                        while generation_config.switch_experts(
+                            next_token_logits_batch[0],
+                            allowed_tokens[allowed_tokens[:, 0] == i][:, -1],
+                            router_logits[-1][0, -1],  # last layer, last token of batch
+                            experts_tried[-1][0, -1],  # last layer, last token of batch
+                        ):
+                            # Apply mask
+                            experts_list = [
+                                experts_layer.tolist()
+                                for experts_layer in experts_tried
+                            ]
+                            for layer in range(len(router_logits)):
+                                experts_list[layer][0] = [
+                                    (
+                                        None
+                                        if not switching_mask[layer][0, seq]
+                                        else experts_list[layer][0][seq]
+                                    )
+                                    for seq in range(len(experts_list[layer][0]))
+                                ]
+                            # Update model inputs
+                            batch_inputs["experts_used"] = experts_list
+                            batch_outputs = self(
+                                **batch_inputs,
+                                return_dict=True,
+                                output_attentions=output_attentions,
+                                output_hidden_states=output_hidden_states,
+                            )
+
+                            next_token_logits_batch = batch_outputs.logits[:, -1, :]
+
+                            # pre-process distribution
+                            next_token_scores_batch = logits_processor(
+                                batch_inputs["input_ids"],
+                                next_token_logits_batch,
+                            )
+                            # Expand router logits to batch size, seq len, num experts
+                            router_logits = [
+                                batch_outputs.router_logits[layer].view(
+                                    1, input_ids.shape[1], -1
+                                )
+                                for layer in range(len(batch_outputs.router_logits))
+                            ]
+
+                            # Concat experts
+                            for layer in range(len(experts_tried)):
+                                experts_tried[layer] = torch.cat(
+                                    [
+                                        experts_tried[layer],
+                                        batch_outputs.experts[layer].view(
+                                            1, input_ids.shape[1], 1, -1
+                                        ),
+                                    ],
+                                    dim=2,
+                                )
+
+                            allowed_tokens = (
+                                next_token_scores_batch != -float("inf")
+                            ).nonzero()
+                    except TooManyExpertsError:
+                        # Fallback
+                        logger.warning(
+                            "Too many experts tried. Falling back to original model."
+                        )
+                        batch_inputs["experts_used"] = None
+                        batch_outputs = self(
+                            **batch_inputs,
+                            return_dict=True,
+                            output_attentions=output_attentions,
+                            output_hidden_states=output_hidden_states,
+                        )
+                        next_token_logits_batch = batch_outputs.logits[:, -1, :]
+
+                        # pre-process distribution
+                        next_token_scores_batch = logits_processor(
+                            batch_inputs["input_ids"],
+                            next_token_logits_batch,
+                        )
+                    next_token_logits[i] = next_token_logits_batch[0]
+                    next_token_scores[i] = next_token_scores_batch[0]
+
+            if do_sample:
+                next_token_scores = logits_warper(input_ids, next_token_scores)
+
+            # Store scores, attentions and hidden_states when required
+            if return_dict_in_generate:
+                if output_scores:
+                    scores += (next_token_scores,)
+                if output_logits:
+                    raw_logits += (next_token_logits,)
+                if output_attentions:
+                    decoder_attentions += (
+                        (outputs.decoder_attentions,)
+                        if self.config.is_encoder_decoder
+                        else (outputs.attentions,)
+                    )
+                    if self.config.is_encoder_decoder:
+                        cross_attentions += (outputs.cross_attentions,)
+
+                if output_hidden_states:
+                    decoder_hidden_states += (
+                        (outputs.decoder_hidden_states,)
+                        if self.config.is_encoder_decoder
+                        else (outputs.hidden_states,)
+                    )
+
+            # token selection
+            if do_sample:
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                next_tokens = torch.argmax(next_token_scores, dim=-1)
+
+            # finished sentences should have their next token be a padding token
+            if has_eos_stopping_criteria:
+                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (
+                    1 - unfinished_sequences
+                )
+
+            # update generated ids, model inputs, and length for next step
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            if streamer is not None:
+                streamer.put(next_tokens.cpu())
+            model_kwargs = self._update_model_kwargs_for_generation(
+                outputs,
+                model_kwargs,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+            )
+
+            unfinished_sequences = unfinished_sequences & ~stopping_criteria(
+                input_ids, scores
+            )
+            this_peer_finished = unfinished_sequences.max() == 0
+
+        if streamer is not None:
+            streamer.end()
+
+        if return_dict_in_generate:
+            if self.config.is_encoder_decoder:
+                return GenerateEncoderDecoderOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    logits=raw_logits,
+                    encoder_attentions=encoder_attentions,
+                    encoder_hidden_states=encoder_hidden_states,
+                    decoder_attentions=decoder_attentions,
+                    cross_attentions=cross_attentions,
+                    decoder_hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                )
+            else:
+                return GenerateDecoderOnlyOutput(
+                    sequences=input_ids,
+                    scores=scores,
+                    logits=raw_logits,
+                    attentions=decoder_attentions,
+                    hidden_states=decoder_hidden_states,
+                    past_key_values=model_kwargs.get("past_key_values"),
+                )
+        else:
+            return input_ids
 
     def prepare_inputs_for_generation(
         self,
