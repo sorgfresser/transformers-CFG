@@ -1,5 +1,4 @@
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union, Callable, Dict, Any
-import inspect
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 from transformers import (
     MixtralForCausalLM,
     LogitsProcessorList,
@@ -11,29 +10,6 @@ from transformers.generation.utils import (
     GenerateNonBeamOutput,
     GenerateEncoderDecoderOutput,
     GenerateDecoderOnlyOutput,
-)
-from transformers.generation.logits_process import (
-    EncoderNoRepeatNGramLogitsProcessor,
-    EncoderRepetitionPenaltyLogitsProcessor,
-    ExponentialDecayLengthPenalty,
-    ForcedBOSTokenLogitsProcessor,
-    ForcedEOSTokenLogitsProcessor,
-    ForceTokensLogitsProcessor,
-    HammingDiversityLogitsProcessor,
-    InfNanRemoveLogitsProcessor,
-    LogitNormalization,
-    LogitsProcessorList,
-    MinLengthLogitsProcessor,
-    MinNewTokensLengthLogitsProcessor,
-    NoBadWordsLogitsProcessor,
-    NoRepeatNGramLogitsProcessor,
-    PrefixConstrainedLogitsProcessor,
-    RepetitionPenaltyLogitsProcessor,
-    SequenceBiasLogitsProcessor,
-    SuppressTokensAtBeginLogitsProcessor,
-    SuppressTokensLogitsProcessor,
-    UnbatchedClassifierFreeGuidanceLogitsProcessor,
-    WatermarkLogitsProcessor,
 )
 import copy
 from transformers.models.mixtral.modeling_mixtral import (
@@ -53,7 +29,7 @@ from transformers.models.mixtral.modeling_mixtral import (
     MixtralRMSNorm,
     MixtralSparseMoeBlock,
 )
-from transformers.utils import logging, is_torchdynamo_compiling
+from transformers.utils import logging
 from dataclasses import dataclass
 import torch
 from torch import nn
@@ -83,47 +59,6 @@ class GenerationConfigRoutable(GenerationConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.switch_experts = kwargs.pop("switch_experts", None)
-
-
-class LogitsProcessorListCallable(LogitsProcessorList):
-    def __call__(
-        self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
-    ) -> torch.FloatTensor:
-        r"""
-        Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-                Indices of input sequence tokens in the vocabulary. [What are input IDs?](../glossary#input-ids)
-            scores (`torch.FloatTensor` of shape `(batch_size, config.vocab_size)`):
-                Prediction scores of a language modeling head. These can be logits for each vocabulary when not using
-                beam search or log softmax for each vocabulary token when using beam search
-            kwargs (`Dict[str, Any]`, *optional*):
-                Additional kwargs that are specific to a logits processor.
-
-        Return:
-            `torch.FloatTensor` of shape `(batch_size, config.vocab_size)`:
-                The processed prediction scores.
-
-        """
-        for processor in self:
-            function_args = inspect.signature(processor.__call__).parameters
-            # Processor is __init__
-            if (
-                len(function_args) == 2
-                and "args" in function_args
-                and "kwargs" in function_args
-            ):
-                processor = processor()
-            if len(function_args) > 2:
-                if not all(arg in kwargs for arg in list(function_args.keys())[2:]):
-                    raise ValueError(
-                        f"Make sure that all the required parameters: {list(function_args.keys())} for "
-                        f"{processor.__class__} are passed to the logits processor."
-                    )
-                scores = processor(input_ids, scores, **kwargs)
-            else:
-                scores = processor(input_ids, scores)
-
-        return scores
 
 
 class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
@@ -589,197 +524,6 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def _get_logits_processor(
-        self,
-        generation_config: GenerationConfig,
-        input_ids_seq_length: int,
-        encoder_input_ids: torch.LongTensor,
-        prefix_allowed_tokens_fn: Callable[[int, torch.Tensor], List[int]],
-        logits_processor: Optional[LogitsProcessorList],
-        device: str = None,
-        model_kwargs: Optional[Dict[str, Any]] = None,
-        negative_prompt_ids: Optional[torch.Tensor] = None,
-        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
-    ) -> LogitsProcessorList:
-        """
-        This class returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsProcessor`]
-        instances used to modify the scores of the language model head.
-        """
-        # instantiate processors list
-        processors = LogitsProcessorListCallable()
-
-        if (
-            generation_config.guidance_scale is not None
-            and generation_config.guidance_scale != 1
-        ):
-            processors.append(
-                UnbatchedClassifierFreeGuidanceLogitsProcessor(
-                    generation_config.guidance_scale,
-                    self,
-                    unconditional_ids=negative_prompt_ids,
-                    unconditional_attention_mask=negative_prompt_attention_mask,
-                    use_cache=model_kwargs["use_cache"],
-                )
-            )
-        if generation_config.sequence_bias is not None:
-            processors.append(
-                SequenceBiasLogitsProcessor(
-                    sequence_bias=generation_config.sequence_bias
-                )
-            )
-
-        if (
-            generation_config.diversity_penalty is not None
-            and generation_config.diversity_penalty > 0.0
-        ):
-            processors.append(
-                HammingDiversityLogitsProcessor(
-                    diversity_penalty=generation_config.diversity_penalty,
-                    num_beams=generation_config.num_beams,
-                    num_beam_groups=generation_config.num_beam_groups,
-                )
-            )
-        if (
-            generation_config.encoder_repetition_penalty is not None
-            and generation_config.encoder_repetition_penalty != 1.0
-        ):
-            processors.append(
-                EncoderRepetitionPenaltyLogitsProcessor(
-                    penalty=generation_config.encoder_repetition_penalty,
-                    encoder_input_ids=encoder_input_ids,
-                )
-            )
-        if (
-            generation_config.repetition_penalty is not None
-            and generation_config.repetition_penalty != 1.0
-        ):
-            processors.append(
-                RepetitionPenaltyLogitsProcessor(
-                    penalty=generation_config.repetition_penalty
-                )
-            )
-        if (
-            generation_config.no_repeat_ngram_size is not None
-            and generation_config.no_repeat_ngram_size > 0
-        ):
-            processors.append(
-                NoRepeatNGramLogitsProcessor(generation_config.no_repeat_ngram_size)
-            )
-        if (
-            generation_config.encoder_no_repeat_ngram_size is not None
-            and generation_config.encoder_no_repeat_ngram_size > 0
-        ):
-            processors.append(
-                EncoderNoRepeatNGramLogitsProcessor(
-                    generation_config.encoder_no_repeat_ngram_size, encoder_input_ids
-                )
-            )
-        if generation_config.bad_words_ids is not None:
-            processors.append(
-                NoBadWordsLogitsProcessor(
-                    generation_config.bad_words_ids, generation_config.eos_token_id
-                )
-            )
-        if (
-            generation_config.min_length is not None
-            and generation_config.eos_token_id is not None
-            and generation_config.min_length > 0
-        ):
-            processors.append(
-                MinLengthLogitsProcessor(
-                    generation_config.min_length, generation_config.eos_token_id
-                )
-            )
-        if (
-            generation_config.min_new_tokens is not None
-            and generation_config.eos_token_id is not None
-            and generation_config.min_new_tokens > 0
-        ):
-            processors.append(
-                MinNewTokensLengthLogitsProcessor(
-                    input_ids_seq_length,
-                    generation_config.min_new_tokens,
-                    generation_config.eos_token_id,
-                )
-            )
-        if prefix_allowed_tokens_fn is not None:
-            processors.append(
-                PrefixConstrainedLogitsProcessor(
-                    prefix_allowed_tokens_fn,
-                    generation_config.num_beams // generation_config.num_beam_groups,
-                )
-            )
-        if generation_config.forced_bos_token_id is not None:
-            processors.append(
-                ForcedBOSTokenLogitsProcessor(generation_config.forced_bos_token_id)
-            )
-        if generation_config.forced_eos_token_id is not None:
-            processors.append(
-                ForcedEOSTokenLogitsProcessor(
-                    generation_config.max_length, generation_config.forced_eos_token_id
-                )
-            )
-        if generation_config.remove_invalid_values is True:
-            processors.append(InfNanRemoveLogitsProcessor())
-        if generation_config.exponential_decay_length_penalty is not None:
-            processors.append(
-                ExponentialDecayLengthPenalty(
-                    generation_config.exponential_decay_length_penalty,
-                    generation_config.eos_token_id,
-                    input_ids_seq_length,
-                )
-            )
-        if generation_config.suppress_tokens is not None:
-            processors.append(
-                SuppressTokensLogitsProcessor(generation_config.suppress_tokens)
-            )
-        if generation_config.begin_suppress_tokens is not None:
-            begin_index = input_ids_seq_length
-            begin_index = (
-                begin_index
-                if (
-                    input_ids_seq_length > 1
-                    or generation_config.forced_bos_token_id is None
-                )
-                else begin_index + 1
-            )
-            if generation_config.forced_decoder_ids is not None:
-                # generation starts after the last token that is forced
-                begin_index += generation_config.forced_decoder_ids[-1][0]
-            processors.append(
-                SuppressTokensAtBeginLogitsProcessor(
-                    generation_config.begin_suppress_tokens, begin_index
-                )
-            )
-        if generation_config.forced_decoder_ids is not None:
-            # TODO(Sanchit): deprecate in v4.40 by removing this logic
-            warnings.warn(
-                "You have explicitly specified `forced_decoder_ids`. This functionality has been deprecated and will throw an error in v4.40. Please remove the `forced_decoder_ids` argument in favour of `input_ids` or `decoder_input_ids` respectively.",
-                FutureWarning,
-            )
-            processors.append(
-                ForceTokensLogitsProcessor(
-                    generation_config.forced_decoder_ids, _has_warned=True
-                )
-            )
-        if generation_config.watermarking_config is not None:
-            processors.append(
-                WatermarkLogitsProcessor(
-                    vocab_size=self.config.vocab_size,
-                    device=device,
-                    greenlist_ratio=generation_config.watermarking_config.greenlist_ratio,
-                    bias=generation_config.watermarking_config.bias,
-                    hashing_key=generation_config.watermarking_config.hashing_key,
-                    seeding_scheme=generation_config.watermarking_config.seeding_scheme,
-                    context_width=generation_config.watermarking_config.context_width,
-                )
-            )
-        processors = self._merge_criteria_processor_list(processors, logits_processor)
-        # `LogitNormalization` should always be the last logit processor, when present
-        if generation_config.renormalize_logits is True:
-            processors.append(LogitNormalization())
-        return processors
-
     def _sample(
         self,
         input_ids: torch.LongTensor,
@@ -903,7 +647,8 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
             next_token_logits = outputs.logits[:, -1, :]
 
             # pre-process distribution
-            next_token_scores = logits_processor(
+            current_processor = copy.deepcopy(logits_processor)
+            next_token_scores = current_processor(
                 input_ids,
                 next_token_logits,
             )
@@ -958,8 +703,9 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                     next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
                     # pre-process distribution
-                    next_token_scores_batch = logits_processor(
-                        batch_inputs["input_ids"],
+                    current_processor = copy.deepcopy(logits_processor)
+                    next_token_scores_batch = current_processor(
+                        input_ids[i, ...][None, ...],
                         next_token_logits_batch,
                     )
 
@@ -1046,8 +792,9 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                             next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
                             # pre-process distribution
-                            next_token_scores_batch = logits_processor(
-                                batch_inputs["input_ids"],
+                            current_processor = copy.deepcopy(logits_processor)
+                            next_token_scores_batch = current_processor(
+                                input_ids[i, ...][None, ...],
                                 next_token_logits_batch,
                             )
                             # Expand router logits to batch size, seq len, num experts
@@ -1119,13 +866,14 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
                         # pre-process distribution
-                        next_token_scores_batch = logits_processor(
-                            batch_inputs["input_ids"],
+                        current_processor = copy.deepcopy(logits_processor)
+                        next_token_scores_batch = current_processor(
+                            input_ids[i, ...][None, ...],
                             next_token_logits_batch,
                         )
                     next_token_logits[i] = next_token_logits_batch[0]
                     next_token_scores[i] = next_token_scores_batch[0]
-
+            logits_processor = current_processor
             if do_sample:
                 next_token_scores = logits_warper(input_ids, next_token_scores)
 
