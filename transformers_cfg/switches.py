@@ -26,7 +26,7 @@ def switch_experts_top_k(
     if any([i in allowed_tokens for i in k_best.indices]):
         print(
             "Not switching experts as one of the top k tokens adheres to the grammar",
-            k_best.indices,
+            list(filter(lambda x: x in allowed_tokens, k_best.indices)),
         )
         return False
     print("Switching experts as none of the top k tokens adheres to the grammar")
