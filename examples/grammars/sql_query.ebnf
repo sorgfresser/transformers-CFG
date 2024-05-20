@@ -15,16 +15,20 @@ join ::= "JOIN" | "LEFT JOIN" | "RIGHT JOIN" | "FULL JOIN" | "INNER JOIN"
 
 join_condition ::= attribute "=" attribute
 
-tables ::= table (join table "ON" join_condition)*
+tables ::= table ws (join ws table "ON" ws join_condition)*
 
-condition ::= attribute "=" value | attribute "<" value | attribute ">" value | attribute "<=" value | attribute ">=" value | attribute "!=" value | attribute "LIKE" value | "(" condition ")" | condition "AND" condition | condition "OR" condition | attribute "IS" "NULL" | attribute "IS" "NOT" "NULL" | attribute "IN" "(" value ("," value)* ")"
+condition ::= single_condition | multiple_conditions
+
+single_condition ::= attribute "=" value | attribute "<" value | attribute ">" value | attribute "<=" value | attribute ">=" value | attribute "!=" value | attribute "LIKE" value | attribute "IS" "NULL" | attribute "IS" "NOT" "NULL" | attribute "IN" "(" value ("," value)* ")"
+
+multiple_conditions ::= "(" condition "AND" condition ")" | "(" condition "OR" condition ")"
 
 order ::= attribute ("ASC" | "DESC")?
 
 value ::= string | number
 
-string ::= [ \t!#-\[\]-~]* ws
+string ::= ([a-z] | [A-Z])+ ws
 
 number ::= ("-"? ([0-9] | [1-9] [0-9]*)) ("." [0-9]+)? ([eE] [-+]? [0-9]+)? ws
 
-ws ::= [ \t\n]
+ws ::= (" " | "\t" | "\n")
