@@ -25,7 +25,7 @@ multiple_conditions ::= "(" condition "AND" condition ")" | "(" condition "OR" c
 
 order ::= attribute ("ASC" | "DESC")?
 
-value ::= string | number
+value ::= ("'" string "'") | number
 
 string ::= ([a-z] | [A-Z])+ ws
 
