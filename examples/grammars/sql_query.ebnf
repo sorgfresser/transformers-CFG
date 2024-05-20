@@ -19,15 +19,23 @@ tables ::= table ws (join ws table "ON" ws join_condition)*
 
 condition ::= single_condition | multiple_conditions
 
-single_condition ::= attribute "=" value | attribute "<" value | attribute ">" value | attribute "<=" value | attribute ">=" value | attribute "!=" value | attribute "LIKE" value | attribute "IS" "NULL" | attribute "IS" "NOT" "NULL" | attribute "IN" "(" value ("," value)* ")"
+single_condition ::= attribute "=" value | attribute "<" value | attribute ">" value | attribute "<=" value | attribute ">=" value | attribute "!=" value | attribute "LIKE" like_value | attribute "IS" "NULL" | attribute "IS" "NOT" "NULL" | attribute "IN" "(" value ("," value)* ")"
 
 multiple_conditions ::= "(" condition "AND" condition ")" | "(" condition "OR" condition ")"
 
 order ::= attribute ("ASC" | "DESC")?
 
-value ::= ("'" string "'") | number
+numeric_value ::= number
 
-string ::= ([a-z] | [A-Z])+ ws
+string_value ::= ("'" string_with_ws "'")
+
+like_value ::= "'" ([a-z] | [A-Z] | "%" | "_")* "'"
+
+value ::= numeric_value | string_value
+
+string_with_ws ::= (string ws)* string
+
+string ::= ([a-z] | [A-Z])+
 
 number ::= ("-"? ([0-9] | [1-9] [0-9]*)) ("." [0-9]+)? ([eE] [-+]? [0-9]+)? ws
 
