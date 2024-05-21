@@ -833,7 +833,9 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                     ).nonzero()
                     cache_mask = [
                         torch.zeros(
-                            outputs.expert_caches[0].shape[:-1], dtype=torch.bool
+                            outputs.expert_caches[0].shape[:-1],
+                            dtype=torch.bool,
+                            device=experts_tried[0].device,
                         )
                         for _ in range(len(experts_tried))
                     ]
@@ -864,7 +866,9 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                             batch_inputs["experts_caches"] = outputs.expert_caches
                             # Add newly cached to mask, every expert in experts_tried is cached
                             cache_mask = [
-                                cache_mask[layer].scatter_(
+                                cache_mask[layer]
+                                .to(experts_tried[0].device)
+                                .scatter_(
                                     1,
                                     experts_tried[layer][
                                         :,
