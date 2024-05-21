@@ -714,14 +714,10 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
             next_token_logits = outputs.logits[:, -1, :]
 
             # pre-process distribution
-            initial_logits_processor = copy.deepcopy(logits_processor)
-            copied_process = copy.deepcopy(initial_logits_processor)
-            scores_copied = copied_process(input_ids, next_token_logits)
             next_token_scores = logits_processor(
                 input_ids,
                 next_token_logits,
             )
-            assert torch.allclose(scores_copied, next_token_scores)
 
             if generation_config.switch_experts is not None:
                 # for i in range(batch_size):
@@ -781,9 +777,6 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         input_ids[i, ...][None, ...],
                         next_token_logits_batch,
                     )
-                    copied_process = copy.deepcopy(initial_logits_processor)
-                    scores_copied = copied_process(input_ids, next_token_logits)
-                    assert torch.allclose(scores_copied, next_token_scores)
 
                     # Expand router logits to batch size, seq len, num experts
                     # If the sequence length is different, key value caching has been used, thus router logits is only 1
@@ -912,9 +905,6 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                                 input_ids[i, ...][None, ...],
                                 next_token_logits_batch,
                             )
-                            copied_process = copy.deepcopy(initial_logits_processor)
-                            scores_copied = copied_process(input_ids, next_token_logits)
-                            assert torch.allclose(scores_copied, next_token_scores)
                             # Expand router logits to batch size, seq len, num experts
                             # If the sequence length is different, key value caching has been used, thus router logits is only 1
                             if (
@@ -991,9 +981,6 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                             input_ids[i, ...][None, ...],
                             next_token_logits_batch,
                         )
-                        copied_process = copy.deepcopy(initial_logits_processor)
-                        scores_copied = copied_process(input_ids, next_token_logits)
-                        assert torch.allclose(scores_copied, next_token_scores)
                     next_token_logits[i] = next_token_logits_batch[0]
                     next_token_scores[i] = next_token_scores_batch[0]
             if do_sample:
