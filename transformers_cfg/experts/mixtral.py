@@ -156,7 +156,7 @@ class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
             hidden_dim,
         )
         experts_cache = (
-            experts_cache
+            experts_cache.to(hidden_states.device)
             if experts_cache is not None
             else torch.zeros(
                 (batch_size * sequence_length, self.num_experts, hidden_dim),
@@ -165,10 +165,12 @@ class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
             )
         )
         cache_mask = (
-            cache_mask
+            cache_mask.to(hidden_states.device)
             if cache_mask is not None
             else torch.zeros(
-                (batch_size * sequence_length, self.num_experts), dtype=torch.bool
+                (batch_size * sequence_length, self.num_experts),
+                dtype=torch.bool,
+                device=hidden_states.device,
             )
         )
 
