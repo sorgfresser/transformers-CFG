@@ -94,7 +94,9 @@ def switch_experts_top_p_experts(
     # Only switch experts if we haven't reached top p experts
     combinations = torch.combinations(torch.arange(EXPERTS), EXPERTS_PER_TOK)
     combinations = combinations.to(gating_logits.device)
-    combinations_mask = (combinations == experts_so_far).all(dim=-1)
+    combinations_mask = (
+        (combinations[:, None, :] == experts_so_far[None, ...]).all(dim=2).any(dim=1)
+    )
     gating_combs = gating_logits[None, :].expand(combinations.shape[0], -1)
     gating_combs = gating_combs.gather(dim=-1, index=combinations).sum(dim=-1)
     # Normalize the probabilities
