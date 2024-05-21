@@ -863,7 +863,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                             # Update model inputs
                             batch_inputs["experts_used"] = experts_list
                             # Update cache
-                            batch_inputs["experts_caches"] = outputs.expert_caches
+                            batch_inputs["experts_caches"] = batch_outputs.expert_caches
                             # Add newly cached to mask, every expert in experts_tried is cached
                             cache_mask = [
                                 cache_mask[layer]
@@ -872,13 +872,13 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                                     1,
                                     experts_tried[layer][
                                         :,
-                                        -outputs.expert_caches[
+                                        -batch_outputs.expert_caches[
                                             0
                                         ]  # expert caches with batch size as separate dimension
                                         .view(
                                             experts_tried[layer].shape[0],
                                             -1,
-                                            *outputs.expert_caches[0].shape[1:],
+                                            *batch_outputs.expert_caches[0].shape[1:],
                                         )
                                         .shape[1] :,
                                     ]
