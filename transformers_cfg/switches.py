@@ -93,20 +93,13 @@ def switch_experts_top_p_experts(
 ):
     # Only switch experts if we haven't reached top p experts
     combinations = torch.combinations(torch.arange(EXPERTS), EXPERTS_PER_TOK)
-
     combinations = combinations.to(gating_logits.device)
-    combinations_mask = torch.zeros(
-        combinations.shape[:-1], dtype=torch.bool, device=combinations.device
-    )
+    combinations_mask = (combinations == experts_so_far).all(dim=-1)
     gating_combs = gating_logits[None, :].expand(combinations.shape[0], -1)
     gating_combs = gating_combs.gather(dim=-1, index=combinations).sum(dim=-1)
     # Normalize the probabilities
     probability_combs = F.softmax(gating_combs, dim=-1)
-    for expert in experts_so_far:
-        expert_comb = torch.tensor(expert, device=probability_combs.device)
-        combinations_mask = combinations_mask | (combinations == expert_comb).all(
-            dim=-1
-        )
+    # Mask out the combinations that are not in the expert_so_far
     probability_combs = probability_combs.masked_fill(~combinations_mask, 0)
     # Sum
     final_value = probability_combs.sum(dim=0)
