@@ -25,11 +25,10 @@ def switch_experts_top_k(
     k_best = torch.topk(probabilities, TOP_K, dim=-1)
     if any([i in allowed_tokens for i in k_best.indices]):
         print(
-            "Not switching experts as one of the top k tokens adheres to the grammar",
+            "One of the top k tokens adheres to the grammar",
             list(filter(lambda x: x in allowed_tokens, k_best.indices)),
         )
         return False
-    print("Switching experts as none of the top k tokens adheres to the grammar")
     return True
 
 
@@ -53,14 +52,14 @@ def switch_experts_top_p(
     for i in range(len(cumulative_probs)):
         if sorted_indices[i] in allowed_tokens:
             print(
-                "Not switching experts as one of the top p tokens adheres to the grammar",
+                "One of the top p tokens adheres to the grammar",
                 sorted_indices[i],
             )
             print("At probability", sorted_probs[i], "cum:", cumulative_probs[i])
             return False
         if cumulative_probs[i] > TOP_P:
             break
-    print("Switching experts as none of the top p tokens adheres to the grammar")
+
     return True
 
 
@@ -77,8 +76,9 @@ def switch_experts_top_k_experts(
     if len(experts_so_far) >= TOP_K or len(experts_so_far) >= comb(
         EXPERTS, EXPERTS_PER_TOK
     ):
+        print("Reached the top k expert combinations.")
         raise TooManyExpertsError("Too many experts")
-    print("Switching experts as we haven't reached the top k experts")
+
     return True
 
 
@@ -109,6 +109,7 @@ def switch_experts_top_p_experts(
     if final_value.item() >= TOP_P or len(experts_so_far) >= comb(
         EXPERTS, EXPERTS_PER_TOK
     ):
+        print("Reached the top p expert combinations.")
         raise TooManyExpertsError("Too many experts")
-    print("Switching experts as we haven't reached the top p experts")
+
     return True
