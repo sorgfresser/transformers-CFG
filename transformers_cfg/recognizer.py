@@ -103,11 +103,6 @@ class StringRecognizer:
     def get_termination_accept_state(self) -> AcceptState:
         return AcceptState(set(), PartialUTF8())
 
-    def clear_cache(self):
-        self.expand_stack_head.cache_clear()
-        self._consume_code_point_for_all_stacks.cache_clear()
-        self._consume_code_point_for_single_stack.cache_clear()
-
     @lru_cache(maxsize=32768)
     def expand_stack_head(self, stack: Tuple[int]) -> Set[Tuple[int]]:
         """

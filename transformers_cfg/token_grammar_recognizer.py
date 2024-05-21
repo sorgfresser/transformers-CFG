@@ -176,8 +176,6 @@ class IncrementalTokenRecognizer(AbsTokenRecognizer):
             raise ValueError("Last size is not set. Cannot undo the last step.")
         self.last_size = self.prev_last_size
         self.prev_last_size = None
-        self.get_token_acceptance_array_for_stack.cache_clear()
-        self.string_recognizer.clear_cache()
 
     def consume_token_ids(self, input_ids, batch_accept_states, parse_start_index=None):
 
