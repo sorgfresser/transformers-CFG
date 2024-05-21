@@ -260,6 +260,8 @@ class MixtralDecoderLayerRoutable(nn.Module):
 
 
 class MixtralModelRoutable(MixtralModel):
+    _no_split_modules = ["MixtralDecoderLayer", "MixtralDecoderLayerRoutable"]
+
     def __init__(self, config: "MixtralConfig"):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
