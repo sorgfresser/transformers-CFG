@@ -3,11 +3,15 @@
 
 root ::= query
 
-query ::= "SELECT" ws attributes ws "FROM" ws tables ws ("WHERE" ws condition)? ws ("GROUP BY" ws attribute)? ws ("ORDER BY" ws order)? ws ("LIMIT" ws number)? ws ("OFFSET" ws number)? ws ";"
+query ::= select ws attributes ws "FROM" ws tables ws ("WHERE" ws condition)? ws ("GROUP BY" ws attribute)? ws ("ORDER BY" ws order)? ws ("LIMIT" ws number)? ws ("OFFSET" ws number)? ws ";"
 
-attribute ::= string
+select ::= "SELECT" | "SELECT" ws "DISTINCT"
 
-attributes ::= attribute ("," attribute)*
+attribute_func ::= "COUNT" "(" ("*" | attribute | "DISTINCT" ws attribute) ")" | "AVG" "(" attribute ")" | "MAX" "(" attribute ")" | "MIN" "(" attribute ")"
+
+attribute ::= (string | attribute_func) ("AS" ws string)?
+
+attributes ::= attribute ("," ws attribute)*
 
 table ::= string
 
