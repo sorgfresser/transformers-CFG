@@ -166,9 +166,16 @@ class IncrementalTokenRecognizer(AbsTokenRecognizer):
     def __init__(self, grammar_str, start_rule_name, tokenizer, unicode=False):
         super().__init__(grammar_str, tokenizer, start_rule_name, unicode)
         self.last_size = None
+        self.prev_last_size = None
 
         # if self.last_size is not set (which would be the case when processing the first token).
         # In this case, do nothing.
+
+    def undo_last_step(self):
+        if self.last_size is None:
+            raise ValueError("Last size is not set. Cannot undo the last step.")
+        self.last_size = self.prev_last_size
+        self.prev_last_size = None
 
     def consume_token_ids(self, input_ids, batch_accept_states, parse_start_index=None):
 

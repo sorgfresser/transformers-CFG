@@ -6,12 +6,14 @@ from transformers import (
     GenerationConfig,
 )
 from transformers_cfg.switches import TooManyExpertsError
+from transformers_cfg.generation.logits_process import GrammarConstrainedLogitsProcessor
 from transformers.generation.utils import (
     GenerateNonBeamOutput,
     GenerateEncoderDecoderOutput,
     GenerateDecoderOnlyOutput,
 )
 import copy
+import time
 from transformers.models.mixtral.modeling_mixtral import (
     MIXTRAL_INPUTS_DOCSTRING,
     MoeCausalLMOutputWithPast,
@@ -712,10 +714,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
             next_token_logits = outputs.logits[:, -1, :]
 
             # pre-process distribution
-            current_processor = copy.deepcopy(
-                logits_processor
-            )  # TODO: replace with something fast
-            next_token_scores = current_processor(
+            next_token_scores = logits_processor(
                 input_ids,
                 next_token_logits,
             )
@@ -770,8 +769,11 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                     next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
                     # pre-process distribution
-                    current_processor = copy.deepcopy(logits_processor)
-                    next_token_scores_batch = current_processor(
+                    for proc in logits_processor:
+                        if isinstance(proc, GrammarConstrainedLogitsProcessor):
+                            proc.undo_last_step()
+
+                    next_token_scores_batch = logits_processor(
                         input_ids[i, ...][None, ...],
                         next_token_logits_batch,
                     )
@@ -896,8 +898,10 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                             next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
                             # pre-process distribution
-                            current_processor = copy.deepcopy(logits_processor)
-                            next_token_scores_batch = current_processor(
+                            for proc in logits_processor:
+                                if isinstance(proc, GrammarConstrainedLogitsProcessor):
+                                    proc.undo_last_step()
+                            next_token_scores_batch = logits_processor(
                                 input_ids[i, ...][None, ...],
                                 next_token_logits_batch,
                             )
@@ -970,14 +974,15 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
                         # pre-process distribution
-                        current_processor = copy.deepcopy(logits_processor)
-                        next_token_scores_batch = current_processor(
+                        for proc in logits_processor:
+                            if isinstance(proc, GrammarConstrainedLogitsProcessor):
+                                proc.undo_last_step()
+                        next_token_scores_batch = logits_processor(
                             input_ids[i, ...][None, ...],
                             next_token_logits_batch,
                         )
                     next_token_logits[i] = next_token_logits_batch[0]
                     next_token_scores[i] = next_token_scores_batch[0]
-            logits_processor = current_processor
             if do_sample:
                 next_token_scores = logits_warper(input_ids, next_token_scores)
 

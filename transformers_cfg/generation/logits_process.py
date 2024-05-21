@@ -24,7 +24,15 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
         self.last_size = None
         self.grammar_constraint = grammar_constraint
         self.batch_accept_states = None
+        self.prev_accept_states = None
         self.parse_start_index = None
+
+    def undo_last_step(self):
+        if self.prev_accept_states is None:
+            raise ValueError("No previous accept states to revert to")
+        self.batch_accept_states = self.prev_accept_states
+        self.prev_accept_states = None
+        self.grammar_constraint.undo_last_step()
 
     def mask_logits(self, logits, device):
         masked_logits = logits.clone()
@@ -98,6 +106,7 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
         self.batch_accept_states = self.grammar_constraint.consume_token_ids(
             input_ids, self.batch_accept_states, self.parse_start_index
         )
+        self.prev_accept_states = copy.deepcopy(self.batch_accept_states)
         logger.debug(f"input_ids: {input_ids}")
 
         masked_scores = self.mask_logits(scores, scores.device)
