@@ -296,6 +296,8 @@ class MixtralDecoderLayerRoutable(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
+
+        if output_experts:
             outputs += (experts_cache,)
 
         if output_router_logits:
@@ -369,6 +371,7 @@ class MixtralModelRoutable(MixtralModel):
         experts_caches: Optional[List[torch.Tensor]] = None,
         experts_cache_masks: Optional[List[torch.Tensor]] = None,
         output_experts: bool = False,
+        all_hidden_states: Optional[tuple[torch.FloatTensor]] = None,
     ) -> Union[Tuple, MoeModelOutputWithPastExperts]:
         output_attentions = (
             output_attentions
@@ -480,20 +483,34 @@ class MixtralModelRoutable(MixtralModel):
                 sliding_window=self.config.sliding_window,
             )
 
-        hidden_states = inputs_embeds
+        hidden_states = (
+            inputs_embeds if all_hidden_states is None else all_hidden_states[0]
+        )
 
         # decoder layers
-        all_hidden_states = () if output_hidden_states else None
+        all_hidden_states_new = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
         all_experts = () if output_experts else None
-        all_experts_caches = () if use_cache else None
+        all_experts_caches = () if output_experts else None
         next_decoder_cache = None
+        compute_new = False
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
+                all_hidden_states_new += (hidden_states,)
+            if experts_used is not None and any(
+                map(lambda x: any(map(lambda y: y is not None, x)), experts_used[idx])
+            ):
+                compute_new = True
+            if (
+                all_hidden_states is not None
+                and (idx < len(all_hidden_states) - 1)
+                and not compute_new
+            ):  # Offset by 1 because the first hidden state is the input embeds
+                hidden_states = all_hidden_states[idx + 1]
+                continue
+            compute_new = True  # If one layer computes new hidden states, all subsequent layers will do so as well
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
@@ -532,7 +549,6 @@ class MixtralModelRoutable(MixtralModel):
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-                all_experts_caches += (layer_outputs[3 if output_attentions else 2],)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -540,19 +556,28 @@ class MixtralModelRoutable(MixtralModel):
             if output_router_logits:
                 all_router_logits += (layer_outputs[-2 if output_experts else -1],)
             if output_experts:
+                all_experts_caches += (
+                    layer_outputs[
+                        (
+                            3
+                            if output_attentions and use_cache
+                            else (2 if use_cache or output_attentions else 1)
+                        )
+                    ],
+                )
                 all_experts += (layer_outputs[-1],)
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states) if compute_new else hidden_states
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+            all_hidden_states_new += (hidden_states,)
 
         next_cache = None
         if use_cache:
             next_cache = (
                 next_decoder_cache.to_legacy_cache()
-                if use_legacy_cache
+                if next_decoder_cache is not None and use_legacy_cache
                 else next_decoder_cache
             )
 
@@ -562,7 +587,7 @@ class MixtralModelRoutable(MixtralModel):
                 for v in [
                     hidden_states,
                     next_cache,
-                    all_hidden_states,
+                    all_hidden_states_new,
                     all_self_attns,
                     all_router_logits,
                     all_experts_caches,
@@ -573,7 +598,7 @@ class MixtralModelRoutable(MixtralModel):
         return MoeModelOutputWithPastExperts(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
-            hidden_states=all_hidden_states,
+            hidden_states=all_hidden_states_new,
             attentions=all_self_attns,
             router_logits=all_router_logits,
             experts=all_experts,
@@ -717,8 +742,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
 
             # pre-process distribution
             next_token_scores = logits_processor(
-                input_ids,
-                next_token_logits,
+                input_ids, next_token_logits, batch_idx=None
             )
 
             if generation_config.switch_experts is not None:
@@ -761,12 +785,44 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         if batch_inputs["past_key_values"] is not None
                         else None
                     )
+                    batch_inputs["all_hidden_states"] = [
+                        hidden_states[i, ...][None, ...]
+                        for hidden_states in outputs.hidden_states
+                    ]
+                    # Do not build kv cache, that is job of initial run per token
+                    batch_inputs["use_cache"] = (
+                        batch_inputs["past_key_values"] is not None
+                    )
                     batch_outputs = self(
                         **batch_inputs,
                         return_dict=True,
                         output_attentions=output_attentions,
                         output_hidden_states=output_hidden_states,
                     )
+
+                    # Set not computed (because of cache) batch outputs based on outputs
+                    batch_outputs.router_logits = [
+                        outputs.router_logits[j].view(
+                            batch_size, -1, outputs.router_logits[j].shape[1]
+                        )[i, ...]
+                        for j in range(len(outputs.router_logits))
+                    ]
+                    batch_outputs.experts = [
+                        outputs.experts[j].view(
+                            batch_size, -1, outputs.experts[j].shape[1]
+                        )[i, ...]
+                        for j in range(len(outputs.experts))
+                    ]
+                    batch_outputs.expert_caches = [
+                        outputs.expert_caches[j].view(
+                            batch_size, -1, *outputs.expert_caches[j].shape[1:]
+                        )[i, ...]
+                        for j in range(len(outputs.expert_caches))
+                    ]
+                    # batch_outputs.past_key_values = [
+                    #     (key[i, ...][None, ...], value[i, ...][None, ...])
+                    #     for key, value in outputs.past_key_values
+                    # ]
 
                     next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
@@ -778,6 +834,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                     next_token_scores_batch = logits_processor(
                         input_ids[i, ...][None, ...],
                         next_token_logits_batch,
+                        batch_idx=i,
                     )
 
                     # Expand router logits to batch size, seq len, num experts
@@ -901,6 +958,36 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                                 output_hidden_states=output_hidden_states,
                             )
 
+                            # Set not computed (because of cache) batch outputs based on outputs
+                            # the last k layers may not have been cached, combine batch output and regular output
+                            computed_layers = len(batch_outputs.router_logits)
+                            batch_outputs.router_logits = [
+                                outputs.router_logits[j].view(
+                                    batch_size, -1, outputs.router_logits[j].shape[1]
+                                )[i, ...]
+                                for j in range(
+                                    len(outputs.router_logits) - computed_layers
+                                )
+                            ] + list(batch_outputs.router_logits)
+                            batch_outputs.experts = [
+                                outputs.experts[j].view(
+                                    batch_size, -1, outputs.experts[j].shape[1]
+                                )[i, ...]
+                                for j in range(len(outputs.experts) - computed_layers)
+                            ] + list(batch_outputs.experts)
+                            batch_outputs.expert_caches = [
+                                outputs.expert_caches[j].view(
+                                    batch_size, -1, *outputs.expert_caches[j].shape[1:]
+                                )[i, ...]
+                                for j in range(
+                                    len(outputs.expert_caches) - computed_layers
+                                )
+                            ] + list(batch_outputs.expert_caches)
+                            # batch_outputs.past_key_values = [
+                            #     (key[i, ...][None, ...], value[i, ...][None, ...])
+                            #     for key, value in outputs.past_key_values
+                            # ]
+
                             next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
                             # pre-process distribution
@@ -910,6 +997,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                             next_token_scores_batch = logits_processor(
                                 input_ids[i, ...][None, ...],
                                 next_token_logits_batch,
+                                batch_idx=i,
                             )
                             # Expand router logits to batch size, seq len, num experts
                             # If the sequence length is different, key value caching has been used, thus router logits is only 1
@@ -986,6 +1074,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         next_token_scores_batch = logits_processor(
                             input_ids[i, ...][None, ...],
                             next_token_logits_batch,
+                            batch_idx=i,
                         )
                     next_token_logits[i] = next_token_logits_batch[0]
                     next_token_scores[i] = next_token_scores_batch[0]
@@ -1158,6 +1247,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
         experts_used: Optional[List[List[Tuple[int]]]] = None,
         experts_caches: Optional[List[torch.Tensor]] = None,
         experts_cache_masks: Optional[List[torch.Tensor]] = None,
+        all_hidden_states: Optional[Tuple[torch.FloatTensor]] = None,
     ) -> Union[Tuple, MoeCausalLMOutputWithPastExperts]:
         r"""
         Args:
@@ -1212,7 +1302,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,  # TODO: Allow cache
+            use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
@@ -1221,6 +1311,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
             experts_used=experts_used,
             experts_caches=experts_caches,
             experts_cache_masks=experts_cache_masks,
+            all_hidden_states=all_hidden_states,
         )
 
         hidden_states = outputs[0]
