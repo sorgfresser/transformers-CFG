@@ -34,14 +34,19 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
         self.prev_accept_states = None
         self.grammar_constraint.undo_last_step()
 
-    def mask_logits(self, logits, device):
+    def mask_logits(self, logits, device, batch_idx=None):
         masked_logits = logits.clone()
         # resolve each stack to a tensor of True/False for each token
         # indicating acceptance
         # acceptance = self.grammar_acceptor.filter_vocab(self.stacks, device)
-        acceptance = self.grammar_constraint.batch_filter_vocab(
-            self.batch_accept_states, device
-        )
+        if batch_idx is not None:
+            acceptance = self.grammar_constraint.batch_filter_vocab(
+                [self.batch_accept_states[batch_idx]], device
+            )
+        else:
+            acceptance = self.grammar_constraint.batch_filter_vocab(
+                self.batch_accept_states, device
+            )
         # acceptance is a tensor of shape (batch_size, vocab_size)
         # get the indices of the accepted tokens
         # do the following operation only in debug mode
@@ -73,7 +78,7 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
         return masked_logits
 
     # TODO: batching
-    def process_logits(self, input_ids, scores):
+    def process_logits(self, input_ids, scores, batch_idx=None):
         """
         :param input_ids:
         :param scores:
@@ -102,14 +107,25 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
             )
         )
         # logger.debug("stacks: \n" + pprint.pformat(self.batch_accept_states.stacks))
+        if batch_idx is not None:
+            self.batch_accept_states[batch_idx] = (
+                self.grammar_constraint.consume_token_ids(
+                    input_ids,
+                    [self.batch_accept_states[batch_idx]],
+                    self.parse_start_index,
+                )[0]
+            )
 
-        self.batch_accept_states = self.grammar_constraint.consume_token_ids(
-            input_ids, self.batch_accept_states, self.parse_start_index
-        )
+        else:
+            self.batch_accept_states = self.grammar_constraint.consume_token_ids(
+                input_ids,
+                self.batch_accept_states,
+                self.parse_start_index,
+            )
         self.prev_accept_states = copy.deepcopy(self.batch_accept_states)
         logger.debug(f"input_ids: {input_ids}")
 
-        masked_scores = self.mask_logits(scores, scores.device)
+        masked_scores = self.mask_logits(scores, scores.device, batch_idx)
         return masked_scores
 
     @add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
@@ -118,5 +134,6 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
         self,
         input_ids: torch.LongTensor,
         scores: torch.FloatTensor,
+        batch_idx: int = None,
     ) -> torch.FloatTensor:
-        return self.process_logits(input_ids, scores)
+        return self.process_logits(input_ids, scores, batch_idx)
