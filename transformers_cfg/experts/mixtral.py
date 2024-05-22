@@ -720,7 +720,11 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
             this_peer_finished, synced_gpus, device=input_ids.device
         ):
             # prepare model inputs
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            model_inputs = self.prepare_inputs_for_generation(
+                input_ids,
+                output_router_logits=generation_config.output_router_logits,
+                **model_kwargs,
+            )
             if generation_config.switch_experts is not None:
                 if not model_inputs["output_router_logits"]:
                     logger.warning(
