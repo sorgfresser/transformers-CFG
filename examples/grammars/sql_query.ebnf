@@ -19,7 +19,7 @@ join ::= "JOIN" | "LEFT JOIN" | "RIGHT JOIN" | "FULL JOIN" | "INNER JOIN"
 
 join_condition ::= attribute "=" attribute
 
-tables ::= table ws (join ws table ws "ON" ws join_condition)*
+tables ::= table (ws join ws table ws "ON" ws join_condition)*
 
 condition ::= single_condition | multiple_conditions
 
