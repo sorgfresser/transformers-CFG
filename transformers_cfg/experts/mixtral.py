@@ -848,7 +848,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         != batch_outputs.router_logits[0].shape[0]
                     ):
                         batch_outputs.router_logits = [
-                            batch_outputs.router_logits[j].view(1, 1, -1)
+                            batch_outputs.router_logits[j][-1].view(1, 1, -1)
                             for j in range(len(batch_outputs.router_logits))
                         ]
                         # Simply expand this as we're using the last token later on
@@ -876,7 +876,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                     # If the sequence length is different, key value caching has been used, thus experts is only 1
                     if input_ids.shape[1] * 1 != batch_outputs.experts[0].shape[0]:
                         batch_outputs.experts = [
-                            batch_outputs.experts[j].view(1, 1, 1, -1)
+                            batch_outputs.experts[j][-1].view(1, 1, 1, -1)
                             for j in range(len(batch_outputs.experts))
                         ]
                         batch_outputs.experts = [
@@ -1010,7 +1010,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                                 != batch_outputs.router_logits[0].shape[0]
                             ):
                                 batch_outputs.router_logits = [
-                                    batch_outputs.router_logits[j].view(1, 1, -1)
+                                    batch_outputs.router_logits[j][-1].view(1, 1, -1)
                                     for j in range(len(batch_outputs.router_logits))
                                 ]
                                 # Simply expand this as we're using the last token later on
@@ -1032,7 +1032,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                                 != batch_outputs.experts[0].shape[0]
                             ):
                                 batch_outputs.experts = [
-                                    batch_outputs.experts[j].view(1, 1, 1, -1)
+                                    batch_outputs.experts[j][-1].view(1, 1, 1, -1)
                                     for j in range(len(batch_outputs.experts))
                                 ]
                                 batch_outputs.experts = [
