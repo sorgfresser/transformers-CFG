@@ -198,7 +198,12 @@ class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
             test_current_hidden_states = (
                 expert_layer(current_state) * routing_weights[top_x, idx, None]
             )
-            assert torch.allclose(current_hidden_states, test_current_hidden_states, atol=1e-03, rtol=1e-03)
+            assert torch.allclose(
+                current_hidden_states,
+                test_current_hidden_states,
+                atol=1e-03,
+                rtol=1e-03,
+            )
 
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
@@ -618,6 +623,87 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def _expand_outputs_for_switching(
+        self,
+        outputs: MoeCausalLMOutputWithPastExperts,
+        expand_size: int = 1,
+        batch_size: int = 1,
+    ):
+        """
+        Expand the outputs of the model for switching experts processing to the correct size
+
+        Args:
+            outputs: The outputs of the model
+            expand_size: The size to expand the outputs to
+        """
+        assert batch_size == 1, "Batch size > 1 is not supported for switching experts"
+        # If they match, we don't need to expand
+        if expand_size * batch_size != outputs.router_logits[0].shape[0]:
+            # Takes the last token of each layer, requires batch size of 1
+            outputs.router_logits = [
+                outputs.router_logits[j][-1].view(1, 1, -1)
+                for j in range(len(outputs.router_logits))
+            ]
+            # Simply expand this as we're using the last token later on, this will drop the router logits
+            # for tokens that are not the last
+            outputs.router_logits = [
+                outputs.router_logits[j].expand(1, expand_size, -1)
+                for j in range(len(outputs.router_logits))
+            ]
+        # If they match, we don't need to expand
+        if expand_size * batch_size != outputs.experts[0].shape[0]:
+            # Simply expand this as we're using the last token later on, this will drop the experts
+            # for tokens that are not the last
+            outputs.experts = [
+                outputs.experts[j][-1].view(1, 1, 1, -1)
+                for j in range(len(outputs.experts))
+            ]
+            outputs.experts = [
+                outputs.experts[j].expand(1, expand_size, 1, -1)
+                for j in range(len(outputs.experts))
+            ]
+        return outputs
+
+    def _merge_cached(
+        self,
+        old_outputs: MoeCausalLMOutputWithPastExperts,
+        newly_computed: MoeCausalLMOutputWithPastExperts,
+        batch_size: int,
+        batch_idx: int = None,
+    ):
+        """
+        Merge the newly computed outputs with the cached outputs
+
+        Args:
+            old_outputs: The cached outputs
+            newly_computed: The newly computed outputs
+            batch_size: The batch size
+            batch_idx: The batch index, if newly_computed is only a single input of the batch
+        """
+        assert (
+            batch_idx is not None and batch_size == 1
+        ), "Batch idx must be set as multiple batch entries are not supported yet"
+        computed_layers = len(newly_computed.router_logits)
+        newly_computed.router_logits = [
+            old_outputs.router_logits[j].view(
+                batch_size, -1, old_outputs.router_logits[j].shape[1]
+            )[batch_idx, ...]
+            for j in range(len(old_outputs.router_logits) - computed_layers)
+        ] + list(newly_computed.router_logits)
+        newly_computed.experts = [
+            old_outputs.experts[j].view(
+                batch_size, -1, old_outputs.experts[j].shape[1]
+            )[batch_idx, ...]
+            for j in range(len(old_outputs.experts) - computed_layers)
+        ] + list(newly_computed.experts)
+        newly_computed.expert_caches = [
+            old_outputs.expert_caches[j].view(
+                batch_size, -1, *old_outputs.expert_caches[j].shape[1:]
+            )[batch_idx, ...]
+            for j in range(len(old_outputs.expert_caches) - computed_layers)
+        ] + list(newly_computed.expert_caches)
+        return newly_computed
+
     def _sample(
         self,
         input_ids: torch.LongTensor,
@@ -805,28 +891,9 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                     )
 
                     # Set not computed (because of cache) batch outputs based on outputs
-                    batch_outputs.router_logits = [
-                        outputs.router_logits[j].view(
-                            batch_size, -1, outputs.router_logits[j].shape[1]
-                        )[i, ...]
-                        for j in range(len(outputs.router_logits))
-                    ]
-                    batch_outputs.experts = [
-                        outputs.experts[j].view(
-                            batch_size, -1, outputs.experts[j].shape[1]
-                        )[i, ...]
-                        for j in range(len(outputs.experts))
-                    ]
-                    batch_outputs.expert_caches = [
-                        outputs.expert_caches[j].view(
-                            batch_size, -1, *outputs.expert_caches[j].shape[1:]
-                        )[i, ...]
-                        for j in range(len(outputs.expert_caches))
-                    ]
-                    # batch_outputs.past_key_values = [
-                    #     (key[i, ...][None, ...], value[i, ...][None, ...])
-                    #     for key, value in outputs.past_key_values
-                    # ]
+                    batch_outputs = self._merge_cached(
+                        outputs, batch_outputs, batch_size, i
+                    )
 
                     next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
@@ -841,28 +908,17 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         batch_idx=i,
                     )
 
-                    # Expand router logits to batch size, seq len, num experts
-                    # If the sequence length is different, key value caching has been used, thus router logits is only 1
-                    if (
-                        input_ids.shape[1] * 1
-                        != batch_outputs.router_logits[0].shape[0]
-                    ):
-                        batch_outputs.router_logits = [
-                            batch_outputs.router_logits[j][-1].view(1, 1, -1)
-                            for j in range(len(batch_outputs.router_logits))
-                        ]
-                        # Simply expand this as we're using the last token later on
-                        batch_outputs.router_logits = [
-                            batch_outputs.router_logits[j].expand(
-                                1, input_ids.shape[1], -1
-                            )
-                            for j in range(len(batch_outputs.router_logits))
-                        ]
+                    batch_outputs = self._expand_outputs_for_switching(
+                        batch_outputs, input_ids.shape[1], 1
+                    )
                     router_logits = [
                         batch_outputs.router_logits[j].view(1, input_ids.shape[1], -1)
                         for j in range(len(batch_outputs.router_logits))
                     ]
-
+                    experts_tried = [
+                        batch_outputs.experts[j].view(1, input_ids.shape[1], 1, -1)
+                        for j in range(len(batch_outputs.experts))
+                    ]
                     switching_mask = [
                         torch.zeros(router_logits[j].shape[:2], dtype=torch.bool)
                         for j in range(len(router_logits))
@@ -873,22 +929,6 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                     # Alternative: only last token and last layer
                     switching_mask[-1][:, -1] = True
 
-                    # If the sequence length is different, key value caching has been used, thus experts is only 1
-                    if input_ids.shape[1] * 1 != batch_outputs.experts[0].shape[0]:
-                        batch_outputs.experts = [
-                            batch_outputs.experts[j][-1].view(1, 1, 1, -1)
-                            for j in range(len(batch_outputs.experts))
-                        ]
-                        batch_outputs.experts = [
-                            batch_outputs.experts[j].expand(
-                                1, input_ids.shape[1], 1, -1
-                            )
-                            for j in range(len(batch_outputs.experts))
-                        ]
-                    experts_tried = [
-                        batch_outputs.experts[j].view(1, input_ids.shape[1], 1, -1)
-                        for j in range(len(batch_outputs.experts))
-                    ]
                     allowed_tokens = (
                         next_token_scores_batch != -float("inf")
                     ).nonzero()
@@ -962,35 +1002,9 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                                 output_hidden_states=output_hidden_states,
                             )
 
-                            # Set not computed (because of cache) batch outputs based on outputs
-                            # the last k layers may not have been cached, combine batch output and regular output
-                            computed_layers = len(batch_outputs.router_logits)
-                            batch_outputs.router_logits = [
-                                outputs.router_logits[j].view(
-                                    batch_size, -1, outputs.router_logits[j].shape[1]
-                                )[i, ...]
-                                for j in range(
-                                    len(outputs.router_logits) - computed_layers
-                                )
-                            ] + list(batch_outputs.router_logits)
-                            batch_outputs.experts = [
-                                outputs.experts[j].view(
-                                    batch_size, -1, outputs.experts[j].shape[1]
-                                )[i, ...]
-                                for j in range(len(outputs.experts) - computed_layers)
-                            ] + list(batch_outputs.experts)
-                            batch_outputs.expert_caches = [
-                                outputs.expert_caches[j].view(
-                                    batch_size, -1, *outputs.expert_caches[j].shape[1:]
-                                )[i, ...]
-                                for j in range(
-                                    len(outputs.expert_caches) - computed_layers
-                                )
-                            ] + list(batch_outputs.expert_caches)
-                            # batch_outputs.past_key_values = [
-                            #     (key[i, ...][None, ...], value[i, ...][None, ...])
-                            #     for key, value in outputs.past_key_values
-                            # ]
+                            batch_outputs = self._merge_cached(
+                                outputs, batch_outputs, batch_size, i
+                            )
 
                             next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
@@ -1003,45 +1017,15 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                                 next_token_logits_batch,
                                 batch_idx=i,
                             )
-                            # Expand router logits to batch size, seq len, num experts
-                            # If the sequence length is different, key value caching has been used, thus router logits is only 1
-                            if (
-                                input_ids.shape[1] * 1
-                                != batch_outputs.router_logits[0].shape[0]
-                            ):
-                                batch_outputs.router_logits = [
-                                    batch_outputs.router_logits[j][-1].view(1, 1, -1)
-                                    for j in range(len(batch_outputs.router_logits))
-                                ]
-                                # Simply expand this as we're using the last token later on
-                                batch_outputs.router_logits = [
-                                    batch_outputs.router_logits[j].expand(
-                                        1, input_ids.shape[1], -1
-                                    )
-                                    for j in range(len(batch_outputs.router_logits))
-                                ]
+                            batch_outputs = self._expand_outputs_for_switching(
+                                batch_outputs, input_ids.shape[1], 1
+                            )
                             router_logits = [
                                 batch_outputs.router_logits[j].view(
                                     1, input_ids.shape[1], -1
                                 )
                                 for j in range(len(batch_outputs.router_logits))
                             ]
-                            # If the sequence length is different, key value caching has been used, thus experts is only 1
-                            if (
-                                input_ids.shape[1] * 1
-                                != batch_outputs.experts[0].shape[0]
-                            ):
-                                batch_outputs.experts = [
-                                    batch_outputs.experts[j][-1].view(1, 1, 1, -1)
-                                    for j in range(len(batch_outputs.experts))
-                                ]
-                                batch_outputs.experts = [
-                                    batch_outputs.experts[j].expand(
-                                        1, input_ids.shape[1], 1, -1
-                                    )
-                                    for j in range(len(batch_outputs.experts))
-                                ]
-
                             # Concat experts
                             for layer in range(len(experts_tried)):
                                 experts_tried[layer] = torch.cat(
