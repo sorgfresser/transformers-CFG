@@ -26,12 +26,16 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
         self.batch_accept_states = None
         self.prev_accept_states = None
         self.parse_start_index = None
+        self.last_input_ids = None
+        self.last_acceptance = None
 
     def undo_last_step(self):
         if self.prev_accept_states is None:
             raise ValueError("No previous accept states to revert to")
         self.batch_accept_states = self.prev_accept_states
         self.prev_accept_states = None
+        self.last_input_ids = None
+        self.last_acceptance = None
         self.grammar_constraint.undo_last_step()
 
     def mask_logits(self, logits, device, batch_idx=None):
@@ -47,6 +51,8 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
             acceptance = self.grammar_constraint.batch_filter_vocab(
                 self.batch_accept_states, device
             )
+        self.last_acceptance = acceptance
+
         # acceptance is a tensor of shape (batch_size, vocab_size)
         # get the indices of the accepted tokens
         # do the following operation only in debug mode
@@ -106,6 +112,14 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
                 [len(acc_state.stacks) for acc_state in self.batch_accept_states]
             )
         )
+        if self.last_input_ids is not None and torch.equal(
+            input_ids, self.last_input_ids
+        ):
+            logger.debug("input_ids are equal to last_input_ids")
+            logits = scores.clone()
+            logits[~self.last_acceptance] = -math.inf
+            return logits
+
         # logger.debug("stacks: \n" + pprint.pformat(self.batch_accept_states.stacks))
         if batch_idx is not None:
             self.batch_accept_states[batch_idx] = (
@@ -123,6 +137,7 @@ class GrammarConstrainedLogitsProcessor(LogitsProcessor):
                 self.parse_start_index,
             )
         self.prev_accept_states = copy.deepcopy(self.batch_accept_states)
+        self.last_input_ids = input_ids
         logger.debug(f"input_ids: {input_ids}")
 
         masked_scores = self.mask_logits(scores, scores.device, batch_idx)

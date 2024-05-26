@@ -1009,9 +1009,6 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                             next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
                             # pre-process distribution
-                            for proc in logits_processor:
-                                if isinstance(proc, GrammarConstrainedLogitsProcessor):
-                                    proc.undo_last_step()
                             next_token_scores_batch = logits_processor(
                                 input_ids[i, ...][None, ...],
                                 next_token_logits_batch,
@@ -1056,9 +1053,6 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         next_token_logits_batch = batch_outputs.logits[:, -1, :]
 
                         # pre-process distribution
-                        for proc in logits_processor:
-                            if isinstance(proc, GrammarConstrainedLogitsProcessor):
-                                proc.undo_last_step()
                         next_token_scores_batch = logits_processor(
                             input_ids[i, ...][None, ...],
                             next_token_logits_batch,
