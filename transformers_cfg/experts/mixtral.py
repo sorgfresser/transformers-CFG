@@ -59,6 +59,13 @@ class MoeCausalLMOutputWithPastExperts(MoeCausalLMOutputWithPast):
     expert_caches: Optional[Tuple[torch.FloatTensor]] = None
 
 
+@dataclass
+class GenerateDecoderOnlyOutputExperts(GenerateDecoderOnlyOutput):
+    num_fallbacks: Optional[int] = None
+    num_switches: Optional[int] = None
+    num_switches_wo_fallback: Optional[int] = None
+
+
 class GenerationConfigRoutable(GenerationConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -790,6 +797,9 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
             batch_size, dtype=torch.long, device=input_ids.device
         )
         model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+        num_fallbacks = 0
+        num_switches = 0
+        num_switches_wo_fallback = 0
 
         while self._has_unfinished_sequences(
             this_peer_finished, synced_gpus, device=input_ids.device
@@ -844,6 +854,8 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                 #     ]
                 # TODO: allow batching
                 for i in range(batch_size):
+                    fallbacked = False
+                    switches = 0
                     batch_inputs = copy.deepcopy(model_inputs)
                     # Only use the i-th batch
                     # We keep the first dimension to be able to implement batching easier
@@ -936,6 +948,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                             router_logits[-1][0, -1],  # last layer, last token of batch
                             experts_tried[-1][0, -1],  # last layer, last token of batch
                         ):
+                            switches += 1
                             # Apply mask
                             experts_list = [
                                 experts_layer.tolist()
@@ -1032,6 +1045,8 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         logger.warning(
                             "Too many experts tried. Falling back to original model."
                         )
+                        num_fallbacks += 1
+                        fallbacked = True
                         batch_inputs["experts_used"] = None
                         batch_outputs = self(
                             **batch_inputs,
@@ -1049,6 +1064,10 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         )
                     next_token_logits[i] = next_token_logits_batch[0]
                     next_token_scores[i] = next_token_scores_batch[0]
+                    num_switches += switches
+                    if not fallbacked:
+                        num_switches_wo_fallback += switches
+
             if do_sample:
                 next_token_scores = logits_warper(input_ids, next_token_scores)
 
@@ -1119,13 +1138,16 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
             else:
-                return GenerateDecoderOnlyOutput(
+                return GenerateDecoderOnlyOutputExperts(
                     sequences=input_ids,
                     scores=scores,
                     logits=raw_logits,
                     attentions=decoder_attentions,
                     hidden_states=decoder_hidden_states,
                     past_key_values=model_kwargs.get("past_key_values"),
+                    num_fallbacks=num_fallbacks,
+                    num_switches=num_switches,
+                    num_switches_wo_fallback=num_switches_wo_fallback,
                 )
         else:
             return input_ids
