@@ -193,17 +193,6 @@ class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
             current_hidden_states = (
                 experts_cache[top_x, expert_idx] * routing_weights[top_x, idx, None]
             )
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-
-            test_current_hidden_states = (
-                expert_layer(current_state) * routing_weights[top_x, idx, None]
-            )
-            assert torch.allclose(
-                current_hidden_states,
-                test_current_hidden_states,
-                atol=1e-03,
-                rtol=1e-03,
-            )
 
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
