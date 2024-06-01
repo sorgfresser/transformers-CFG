@@ -72,6 +72,33 @@ class GenerationConfigRoutable(GenerationConfig):
         self.switch_experts = kwargs.pop("switch_experts", None)
 
 
+def update_combinations_mask(
+    combinations_mask, combinations, experts_used, switching_mask
+):
+    experts_used = experts_used.squeeze(0)
+    switching_mask = switching_mask.squeeze(0)
+    seq_len, num_combinations, comb_size = combinations.shape
+    _, m, _ = experts_used.shape
+
+    # Expand switching_mask to match the shape of combinations_mask for masking
+    expanded_switching_mask = switching_mask.unsqueeze(1).expand(-1, num_combinations)
+
+    # Reshape combinations and experts_used for broadcasting and comparison
+    combinations_reshaped = combinations.view(seq_len, num_combinations, 1, comb_size)
+    experts_used_reshaped = experts_used.view(seq_len, 1, m, comb_size)
+
+    # Check for equality and reduce across the combination size dimension
+    match_matrix = torch.all(combinations_reshaped == experts_used_reshaped, dim=-1)
+
+    # Any match across experts_used combinations means the combination should be masked out
+    matches = torch.any(match_matrix, dim=-1)
+
+    # Apply the mask where switching_mask is True
+    combinations_mask = combinations_mask & ~(expanded_switching_mask & matches)
+
+    return combinations_mask
+
+
 class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
 
     def __init__(self, config):
@@ -83,7 +110,8 @@ class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        experts_used: Optional[List[List[Tuple[int]]]] = None,
+        experts_used: Optional[torch.IntTensor] = None,
+        switching_mask: Optional[torch.BoolTensor] = None,
         experts_cache: Optional[torch.Tensor] = None,
         cache_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -97,6 +125,11 @@ class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
                 1.0 - self.jitter_noise, 1.0 + self.jitter_noise
             )
         hidden_states = hidden_states.view(-1, hidden_dim)
+        switching_mask = (
+            switching_mask.to(hidden_states.device)
+            if switching_mask is not None
+            else None
+        )
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
@@ -112,19 +145,9 @@ class MixtralSparseMoeBlockRoutable(MixtralSparseMoeBlock):
         )  # (batch * sequence_length, n_combinations)
         # Remove expert combs already used from combinations
         if experts_used is not None:
-            for batch in range(batch_size):
-                if len(experts_used[batch]) > sequence_length:
-                    # Clip due to kv caching
-                    experts_used[batch] = experts_used[batch][-sequence_length:]
-                for idx, experts_token in enumerate(experts_used[batch]):
-                    if experts_token is None:
-                        continue
-                    for tok in experts_token:
-                        # Set mask accordingly
-                        expert_comb = torch.tensor(tok, device=routing_combs.device)
-                        combinations_mask[idx] = combinations_mask[idx] & ~(
-                            (combinations[idx] == expert_comb).all(dim=-1)
-                        )
+            combinations_mask = update_combinations_mask(
+                combinations_mask, combinations, experts_used, switching_mask
+            )
 
         # Apply mask
         routing_combs = routing_combs.masked_fill(~combinations_mask[:, :, None], 0)
@@ -239,7 +262,8 @@ class MixtralDecoderLayerRoutable(nn.Module):
         output_router_logits: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         output_experts: Optional[bool] = False,
-        experts_used: Optional[List[List[Tuple[int]]]] = None,
+        experts_used: Optional[torch.IntTensor] = None,
+        switching_mask: Optional[torch.BoolTensor] = None,
         experts_cache: Optional[torch.Tensor] = None,
         experts_cache_mask: Optional[torch.Tensor] = None,
         **kwargs,
@@ -286,7 +310,11 @@ class MixtralDecoderLayerRoutable(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states, router_logits, experts, experts_cache = self.block_sparse_moe(
-            hidden_states, experts_used, experts_cache, experts_cache_mask
+            hidden_states,
+            experts_used,
+            switching_mask,
+            experts_cache,
+            experts_cache_mask,
         )
         hidden_states = residual + hidden_states
 
@@ -368,7 +396,8 @@ class MixtralModelRoutable(MixtralModel):
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        experts_used: Optional[List[List[Tuple[int]]]] = None,
+        experts_used: Optional[List[torch.IntTensor]] = None,
+        switching_mask: Optional[List[torch.BoolTensor]] = None,
         experts_caches: Optional[List[torch.Tensor]] = None,
         experts_cache_masks: Optional[List[torch.Tensor]] = None,
         output_experts: bool = False,
@@ -408,7 +437,8 @@ class MixtralModelRoutable(MixtralModel):
             raise ValueError(
                 "You have to specify either decoder_input_ids or decoder_inputs_embeds"
             )
-
+        if (experts_used is None) != (switching_mask is None):
+            raise ValueError("experts_used and switching_mask must be used together.")
         past_key_values_length = 0
 
         if self.gradient_checkpointing and self.training:
@@ -500,14 +530,12 @@ class MixtralModelRoutable(MixtralModel):
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states_new += (hidden_states,)
-            if experts_used is not None and any(
-                map(lambda x: any(map(lambda y: y is not None, x)), experts_used[idx])
-            ):
+            if experts_used is not None and torch.any(switching_mask[idx]):
                 compute_new = True
             if (
-                all_hidden_states is not None
+                not compute_new
+                and all_hidden_states is not None
                 and (idx < len(all_hidden_states) - 1)
-                and not compute_new
             ):  # Offset by 1 because the first hidden state is the input embeds
                 hidden_states = all_hidden_states[idx + 1]
                 continue
@@ -534,6 +562,9 @@ class MixtralModelRoutable(MixtralModel):
                     use_cache=use_cache,
                     experts_used=(
                         experts_used[idx] if experts_used is not None else None
+                    ),
+                    switching_mask=(
+                        switching_mask[idx] if switching_mask is not None else None
                     ),
                     output_experts=output_experts,
                     experts_cache=(
@@ -949,22 +980,10 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                             experts_tried[-1][0, -1],  # last layer, last token of batch
                         ):
                             switches += 1
-                            # Apply mask
-                            experts_list = [
-                                experts_layer.tolist()
-                                for experts_layer in experts_tried
-                            ]
-                            for layer in range(len(router_logits)):
-                                experts_list[layer][0] = [
-                                    (
-                                        None
-                                        if not switching_mask[layer][0, seq]
-                                        else experts_list[layer][0][seq]
-                                    )
-                                    for seq in range(len(experts_list[layer][0]))
-                                ]
+
                             # Update model inputs
-                            batch_inputs["experts_used"] = experts_list
+                            batch_inputs["experts_used"] = experts_tried
+                            batch_inputs["switching_mask"] = switching_mask
                             # Update cache
                             batch_inputs["experts_caches"] = batch_outputs.expert_caches
                             # Add newly cached to mask, every expert in experts_tried is cached
@@ -1048,6 +1067,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         num_fallbacks += 1
                         fallbacked = True
                         batch_inputs["experts_used"] = None
+                        batch_inputs["switching_mask"] = None
                         batch_outputs = self(
                             **batch_inputs,
                             return_dict=True,
@@ -1237,7 +1257,8 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        experts_used: Optional[List[List[Tuple[int]]]] = None,
+        experts_used: Optional[List[torch.LongTensor]] = None,
+        switching_mask: Optional[List[torch.BoolTensor]] = None,
         experts_caches: Optional[List[torch.Tensor]] = None,
         experts_cache_masks: Optional[List[torch.Tensor]] = None,
         all_hidden_states: Optional[Tuple[torch.FloatTensor]] = None,
@@ -1302,6 +1323,7 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
             return_dict=return_dict,
             output_experts=True,
             experts_used=experts_used,
+            switching_mask=switching_mask,
             experts_caches=experts_caches,
             experts_cache_masks=experts_cache_masks,
             all_hidden_states=all_hidden_states,
