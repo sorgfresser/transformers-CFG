@@ -78,7 +78,11 @@ def update_combinations_mask(
     experts_used = experts_used.squeeze(0)
     switching_mask = switching_mask.squeeze(0)
     seq_len, num_combinations, comb_size = combinations.shape
-    _, m, _ = experts_used.shape
+    experts_seq_len, m, _ = experts_used.shape
+    # Kv-caching
+    if experts_seq_len != seq_len:
+        experts_used = experts_used[-1, ...].unsqueeze(0)
+        switching_mask = switching_mask[-1, ...].unsqueeze(0)
 
     # Expand switching_mask to match the shape of combinations_mask for masking
     expanded_switching_mask = switching_mask.unsqueeze(1).expand(-1, num_combinations)
