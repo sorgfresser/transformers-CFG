@@ -9,7 +9,9 @@ select ::= "SELECT" | "SELECT" ws "DISTINCT"
 
 attribute_func ::= "COUNT" "(" ("*" | attribute | "DISTINCT" ws attribute) ")" | "AVG" "(" attribute ")" | "MAX" "(" attribute ")" | "MIN" "(" attribute ")"
 
-attribute ::= (string | attribute_func) ("AS" ws string)?
+single_attribute ::= string
+
+attribute ::= (single_attribute | attribute_func) ("AS" ws string)?
 
 attributes ::= attribute ("," ws attribute)*
 
