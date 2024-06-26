@@ -14,6 +14,7 @@ from transformers.generation.utils import (
 )
 import copy
 import time
+import os
 from transformers.models.mixtral.modeling_mixtral import (
     MIXTRAL_INPUTS_DOCSTRING,
     MoeCausalLMOutputWithPast,
@@ -45,6 +46,10 @@ if TYPE_CHECKING:
 KVCacheType = Tuple[Tuple["torch.DoubleTensor", "torch.DoubleTensor"], ...]
 
 logger = logging.get_logger(__name__)
+
+DO_EXPERT_PERFORMANCE_IMPROVEMENTS = (
+    os.environ.get("EXPERT_PERFORMANCE", "true").lower() == "true"
+)
 
 
 @dataclass
@@ -911,10 +916,11 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                         if batch_inputs["past_key_values"] is not None
                         else None
                     )
-                    batch_inputs["all_hidden_states"] = [
-                        hidden_states[i, ...][None, ...]
-                        for hidden_states in outputs.hidden_states
-                    ]
+                    if DO_EXPERT_PERFORMANCE_IMPROVEMENTS:
+                        batch_inputs["all_hidden_states"] = [
+                            hidden_states[i, ...][None, ...]
+                            for hidden_states in outputs.hidden_states
+                        ]
                     # Do not build kv cache, that is job of initial run per token
                     batch_inputs["use_cache"] = (
                         batch_inputs["past_key_values"] is not None
@@ -989,36 +995,41 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
                             batch_inputs["experts_used"] = experts_tried
                             batch_inputs["switching_mask"] = switching_mask
                             # Update cache
-                            batch_inputs["experts_caches"] = batch_outputs.expert_caches
-                            # Add newly cached to mask, every expert in experts_tried is cached
-                            cache_mask = [
-                                cache_mask[layer]
-                                .to(experts_tried[0].device)
-                                .scatter_(
-                                    1,
-                                    experts_tried[layer][
-                                        :,
-                                        -batch_outputs.expert_caches[
-                                            0
-                                        ]  # expert caches with batch size as separate dimension
-                                        .view(
-                                            experts_tried[layer].shape[0],
-                                            -1,
-                                            *batch_outputs.expert_caches[0].shape[1:],
-                                        )
-                                        .shape[1] :,
-                                    ]
-                                    .flatten(2, 3)
-                                    .view(
-                                        -1,
-                                        experts_tried[layer].shape[2]
-                                        * experts_tried[layer].shape[3],
-                                    ),
-                                    1,
+                            if DO_EXPERT_PERFORMANCE_IMPROVEMENTS:
+                                batch_inputs["experts_caches"] = (
+                                    batch_outputs.expert_caches
                                 )
-                                for layer in range(len(cache_mask))
-                            ]
-                            batch_inputs["experts_cache_masks"] = cache_mask
+                                # Add newly cached to mask, every expert in experts_tried is cached
+                                cache_mask = [
+                                    cache_mask[layer]
+                                    .to(experts_tried[0].device)
+                                    .scatter_(
+                                        1,
+                                        experts_tried[layer][
+                                            :,
+                                            -batch_outputs.expert_caches[
+                                                0
+                                            ]  # expert caches with batch size as separate dimension
+                                            .view(
+                                                experts_tried[layer].shape[0],
+                                                -1,
+                                                *batch_outputs.expert_caches[0].shape[
+                                                    1:
+                                                ],
+                                            )
+                                            .shape[1] :,
+                                        ]
+                                        .flatten(2, 3)
+                                        .view(
+                                            -1,
+                                            experts_tried[layer].shape[2]
+                                            * experts_tried[layer].shape[3],
+                                        ),
+                                        1,
+                                    )
+                                    for layer in range(len(cache_mask))
+                                ]
+                                batch_inputs["experts_cache_masks"] = cache_mask
 
                             batch_outputs = self(
                                 **batch_inputs,
