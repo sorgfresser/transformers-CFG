@@ -844,6 +844,8 @@ class MixtralForCausalLMRoutable(MixtralForCausalLM):
         while self._has_unfinished_sequences(
             this_peer_finished, synced_gpus, device=input_ids.device
         ):
+            if not DO_EXPERT_PERFORMANCE_IMPROVEMENTS:
+                model_kwargs.pop("past_key_values", None)
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(
                 input_ids,
